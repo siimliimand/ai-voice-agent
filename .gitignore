@@ -29,3 +29,6 @@ coverage/
 # Local dev artifacts
 *.wav.orig
 tmp/
+
+# Bake-off reports
+reports/

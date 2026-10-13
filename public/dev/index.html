@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>ai-voice-agent — dev call</title>
+  <link rel="stylesheet" href="/static/dev/style.css" />
+</head>
+<body>
+  <main>
+    <h1>Dev call harness</h1>
+    <p class="hint">
+      Streams your microphone (or a fixture wav) into the same voice pipeline
+      Twilio would feed. Server time: <span id="server-info">…</span>
+    </p>
+
+    <section class="controls">
+      <label>
+        Fake caller number
+        <input id="from" type="tel" value="+37200000000" />
+      </label>
+      <label>
+        Input
+        <select id="mode">
+          <option value="mic">Microphone</option>
+          <option value="replay">Replay wav</option>
+        </select>
+      </label>
+      <label id="fixture-wrap" hidden>
+        Fixture
+        <select id="fixture"></select>
+      </label>
+      <button id="start" type="button">Start call</button>
+      <button id="stop" type="button" disabled>Hang up</button>
+    </section>
+
+    <section id="status" class="status idle">idle</section>
+
+    <section class="transcript">
+      <h2>Live transcript</h2>
+      <div id="transcript" class="transcript-list">
+        <p class="empty">No utterances yet — start a call and speak.</p>
+      </div>
+    </section>
+  </main>
+
+  <script src="/static/dev/app.js"></script>
+</body>
+</html>
