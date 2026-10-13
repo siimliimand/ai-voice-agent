@@ -1,6 +1,6 @@
 ## Context
 
-voiceservice is a greenfield service: an AI support worker for inbound client calls, trilingual (Estonian, Russian, English), notes-first. Stakeholder decisions already fixed (see `openspec/config.yaml` context): custom orchestrator over Twilio Media Streams (not ElevenLabs Conversational AI); ElevenLabs Scribe v2 Realtime for STT and Eleven v3 for TTS; all LLMs via OpenRouter with configurable model-per-role; transcripts only, no audio storage; simple admin UI; self-hosted Docker Compose in an EU region.
+ai-voice-agent is a greenfield service: an AI support worker for inbound client calls, trilingual (Estonian, Russian, English), notes-first. Stakeholder decisions already fixed (see `openspec/config.yaml` context): custom orchestrator over Twilio Media Streams (not ElevenLabs Conversational AI); ElevenLabs Scribe v2 Realtime for STT and Eleven v3 for TTS; all LLMs via OpenRouter with configurable model-per-role; transcripts only, no audio storage; simple admin UI; self-hosted Docker Compose in an EU region.
 
 Constraints that shaped the design:
 - Estonian STT accuracy is the highest technical risk (ElevenLabs' own benchmarks place Estonian in its 10–25% WER "good" tier, not "excellent").

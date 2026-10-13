@@ -1,4 +1,4 @@
-# ai-voice-agent (voiceservice)
+# ai-voice-agent
 
 An AI support worker that answers inbound client phone calls, listens and speaks
 trilingually (**Estonian, Russian, English**), and automatically produces
@@ -101,7 +101,7 @@ The full rationale (with alternatives and risks) is in
 ## Repository layout (target)
 
 ```
-voiceservice/
+ai-voice-agent/
 ├── src/
 │   ├── server.ts           # Fastify app: webhooks, WS, admin, API
 │   ├── config/             # typed config (env + file), model-per-role map

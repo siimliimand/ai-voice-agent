@@ -4,7 +4,7 @@ schema: spec-driven
 # This is shown to AI when creating artifacts.
 # Add your tech stack, conventions, style guides, domain knowledge, etc.
 context: |
-  # voiceservice
+  # ai-voice-agent
 
   An AI support worker that answers inbound client phone calls, listens and
   speaks (trilingual: Estonian, Russian, English), takes notes, and (later)
