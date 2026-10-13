@@ -1,0 +1,102 @@
+schema: spec-driven
+
+# Project context (optional)
+# This is shown to AI when creating artifacts.
+# Add your tech stack, conventions, style guides, domain knowledge, etc.
+context: |
+  # voiceservice
+
+  An AI support worker that answers inbound client phone calls, listens and
+  speaks (trilingual: Estonian, Russian, English), takes notes, and (later)
+  performs actions like booking appointments via a pluggable "skills" system.
+
+  ## Architecture decisions (agreed with stakeholders)
+
+  - Build approach: CUSTOM ORCHESTRATOR (not ElevenLabs Conversational AI).
+    Our own Node.js/TypeScript service orchestrates the voice pipeline.
+  - Telephony: Twilio. Inbound voice webhook returns TwiML
+    `<Connect><Stream>`; service handles the bidirectional Media Stream
+    WebSocket (μ-law 8kHz, base64 JSON events: connected/start/media/mark/stop).
+    Barge-in via mark-based playback flush.
+  - Transport abstraction: `CallTransport` interface with two implementations:
+    (1) TwilioMediaStreamTransport (production), (2) BrowserTransport (dev).
+    Dev mode skips Twilio entirely: a `/dev/call` page captures the mic via
+    getUserMedia + AudioWorklet (48k→16k PCM) over WebSocket binary frames,
+    plays TTS audio back via Web Audio API. Fake CallSid/caller number.
+    Doubles as the STT bake-off rig (wav file replay) and e2e test harness.
+    Gated by DEV_BROWSER_CALLS=true.
+  - STT: ElevenLabs Scribe v2 Realtime (~150ms first partial, supports et/ru/en).
+    NOTE: Estonian is in ElevenLabs' "good" (10-25% WER) tier, not excellent.
+    A bake-off vs Soniox / Gladia with real Estonian/Russian call samples is
+    part of milestone 1. STT adapter is an interface for swapping providers.
+  - TTS: ElevenLabs Eleven v3 / v3 Conversational (Flash v2.5 does NOT support
+    Estonian). Fallback: Azure et-EE neural voices. Measure v3 latency in M1.
+  - LLM: OpenRouter (OpenAI-compatible endpoint), provider-agnostic.
+    ALL AI models must be configurable per role via config/env:
+    conversation agent, post-call summarizer, utility (language detection).
+    Optional per-language model overrides (Estonian quality varies by model).
+    Note: streaming + tool-calling behavior varies per OpenRouter model;
+    M1 includes a conformance check for chosen models.
+  - Languages: Estonian, Russian, English. Hybrid language detection:
+    STT auto-detect + cheap utility-model classification of the first
+    utterance, then LOCK STT + TTS voice + prompt variant for the call;
+    re-detect on language switch or low confidence.
+    Estonian-Russian code-switching is common — must be tested.
+  - Scope: INBOUND calls only.
+  - Notes-first: v1 focuses on transcription + post-call summarization.
+    ACTIONS (booking etc. via skills framework) come later.
+  - Skills framework (later milestone): skills are YAML manifests describing
+    how to get data / use tools (JSON Schema params, execution type http|db|rag,
+    auth ref, policies like requires_confirmation). Registry generates the
+    LLM tools array; dispatcher validates and executes.
+  - Data: transcripts only, NO raw call audio stored (GDPR-minimal).
+    Postgres stores: calls, call_transcripts (incrementally persisted,
+    crash-safe), call_notes, call_events (audit log of tool invocations).
+  - Post-call pipeline: on hangup, LLM produces a structured note JSON:
+    summary, language, identified client, intent(s), actions taken,
+    unresolved issues, follow-ups, urgency/sentiment.
+  - Staff interface: simple admin web UI (Fastify-served) listing calls with
+    transcripts + notes.
+  - Consent: announcement at call start (transcripts are PII under GDPR even
+    without audio recording). Retention policy + EU hosting.
+  - Deployment: self-hosted, Docker Compose (app + Postgres), EU region
+    (close to Twilio EU media gateways + ElevenLabs EU inference).
+  - Phone number: +372 local number availability on Twilio is uncertain —
+    decide at launch (fallback: DID provider + Twilio Elastic SIP Trunking).
+    Dev uses any Twilio sandbox number.
+
+  ## Tech stack
+
+  Node.js 22 + TypeScript, Fastify (HTTP + WebSocket on one server),
+  Postgres (via drizzle or kysely), @elevenlabs/elevenlabs-js SDK,
+  OpenRouter via OpenAI-compatible client, Docker Compose.
+  Testing: unit + e2e via browser transport / canned audio fixtures.
+
+  ## Milestone shape (for sequencing proposals)
+
+  - M1: Browser dev harness → pipeline skeleton (STT→LLM→TTS round trip) →
+    STT/TTS bake-off via file replay → Twilio transport → real call test.
+  - M2: Trilingual (detection/locking, per-language prompts+voices), barge-in.
+  - M3: Notes pipeline (live transcript persistence, post-call summarization,
+    structured notes, DB schema, admin UI).
+  - M4: Skills framework + first actions (booking), human escalation, consent
+    announcement, observability (per-stage latency metrics), GDPR retention.
+
+  ## Conventions
+
+  - English for all code, comments, prompts (agent speech adapts to client
+    language at runtime, but repo artifacts are English).
+  - Config via env + config file; every external model/provider reference
+    must be overridable.
+  - Latency budget: end-of-speech → first audio byte back < 1s; measure
+    per-stage (STT finalize, LLM first token, TTS first byte).
+
+# Per-artifact rules (optional)
+# Add custom rules for specific artifacts.
+rules:
+  proposal:
+    - Include a "Non-goals" section
+    - State which milestone(s) the change belongs to
+  tasks:
+    - Break tasks into chunks of max 2 hours
+    - Every task that changes behavior needs a verification step
