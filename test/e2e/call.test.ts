@@ -34,8 +34,6 @@ import {
 } from "../../src/agent/prompts/index.js";
 import { buildApp, type AppHandle } from "../../src/app.js";
 import { configSchema, type AppConfig } from "../../src/config/schema.js";
-import { closeDb, createDb } from "../../src/db/client.js";
-import { runMigrations } from "../../src/db/migrate.js";
 import type { Database } from "../../src/db/schema.js";
 import {
   OpenRouterClient,
@@ -49,6 +47,7 @@ import { ESCALATION_ACTION } from "../../src/notes/summarizer.js";
 import { startMockCalendar, type MockCalendar } from "../fixtures/mock-calendar.js";
 import type { SttEvent, SttProvider, SttStream, SttStreamOptions } from "../../src/stt/types.js";
 import type { TtsProvider } from "../../src/tts/types.js";
+import { createScratchDb, type ScratchDb } from "../helpers/scratch-db.js";
 
 /* ------------------------------------------------------------- constants */
 
@@ -459,6 +458,10 @@ function pcmFromWav(wav: Buffer): Buffer {
 /* ------------------------------------------------------------------ suite */
 
 describe.skipIf(!DATABASE_URL)("e2e: fixture call through the browser transport", () => {
+  // Scratch database: persisted rows (and this suite's cleanup) stay on an
+  // isolated database — never the shared DATABASE_URL database (incident:
+  // suites used to delete the operator's `settings` row there).
+  let scratch: ScratchDb | undefined;
   let handle: AppHandle | undefined;
   let db: Kysely<Database> | undefined;
   /** Synthetic callSid of the call driven in the flow test (dev-...). */
@@ -481,8 +484,8 @@ describe.skipIf(!DATABASE_URL)("e2e: fixture call through the browser transport"
       "utf8",
     ).trim();
 
-    db = createDb(DATABASE_URL);
-    await runMigrations(db);
+    scratch = await createScratchDb("e2e_fixture_call");
+    db = scratch.db;
 
     const config: AppConfig = configSchema.parse({
       logLevel: "error",
@@ -524,19 +527,9 @@ describe.skipIf(!DATABASE_URL)("e2e: fixture call through the browser transport"
     try {
       if (handle) await handle.close();
     } finally {
-      if (db) {
-        // calls row delete cascades to transcripts, notes and events.
-        await db
-          .deleteFrom("calls")
-          .where((eb) =>
-            eb.or([
-              eb("call_sid", "=", callSid ?? "__none__"),
-              eb("from_number", "=", FROM_NUMBER),
-            ]),
-          )
-          .execute();
-        await closeDb(db);
-      }
+      // Dropping the scratch database removes the calls row and everything
+      // cascaded to it (transcripts, notes, events) — no shared-table deletes.
+      if (scratch) await scratch.destroy();
     }
   });
 
@@ -817,6 +810,11 @@ describe.skipIf(!DATABASE_URL)("e2e: fixture call through the browser transport"
 });
 
 describe.skipIf(!DATABASE_URL)("e2e: consent decline and toggle-off scenarios", () => {
+  // Scratch database: the shared `settings` row deletions this suite used to
+  // perform (before AND after the run — an incident-class wipe of the
+  // operator's saved settings) are unnecessary on an isolated database, where
+  // defaults hold because the table starts empty.
+  let scratch: ScratchDb | undefined;
   let db: Kysely<Database> | undefined;
   /** Apps under test, closed in afterAll. */
   const handles: AppHandle[] = [];
@@ -836,11 +834,8 @@ describe.skipIf(!DATABASE_URL)("e2e: consent decline and toggle-off scenarios", 
   };
 
   beforeAll(async () => {
-    db = createDb(DATABASE_URL);
-    await runMigrations(db);
-    // Fresh defaults: a leftover admin-console settings document must not
-    // flip consent off for these scenarios.
-    await requireDb().deleteFrom("settings").where("key", "=", "global").execute();
+    scratch = await createScratchDb("e2e_consent_toggle");
+    db = scratch.db;
 
     const baseConfig: Record<string, unknown> = {
       logLevel: "error",
@@ -934,23 +929,10 @@ describe.skipIf(!DATABASE_URL)("e2e: consent decline and toggle-off scenarios", 
   afterAll(async () => {
     try {
       while (handles.length > 0) await handles.pop()?.close();
-      if (db) {
-        await db
-          .deleteFrom("calls")
-          .where((eb) =>
-            eb.or([
-              eb("from_number", "=", DECLINE_FROM),
-              eb("from_number", "=", TOGGLE_OFF_FROM),
-              ...(declineCallSid ? [eb("call_sid", "=", declineCallSid)] : []),
-              ...(toggleOffCallSid ? [eb("call_sid", "=", toggleOffCallSid)] : []),
-            ]),
-          )
-          .execute();
-        await db.deleteFrom("settings").where("key", "=", "global").execute();
-        await closeDb(db);
-      }
-    } catch {
-      // best-effort cleanup; the suite has already reported its result
+    } finally {
+      // Dropping the scratch database removes the fixture calls rows and
+      // everything cascaded to them — no shared-table deletes.
+      if (scratch) await scratch.destroy();
     }
   });
 
@@ -1051,6 +1033,10 @@ const BOOKING_OUTCOME = "Teie aeg on broneeritud, täname!";
 const GREETING_TAIL = "kuidas saan aidata";
 
 describe.skipIf(!DATABASE_URL)("e2e: booking skill over the browser transport (task 8.1)", () => {
+  // Scratch database: like the other e2e suites, the persisted rows stay on
+  // an isolated database (this suite used to delete the shared `settings`
+  // row on DATABASE_URL — an incident-class wipe of the operator's data).
+  let scratch: ScratchDb | undefined;
   let db: Kysely<Database> | undefined;
   /** RUNNING mock calendar the skills.http.booking endpoint points at. */
   let calendar: MockCalendar | undefined;
@@ -1069,11 +1055,8 @@ describe.skipIf(!DATABASE_URL)("e2e: booking skill over the browser transport (t
   };
 
   beforeAll(async () => {
-    db = createDb(DATABASE_URL);
-    await runMigrations(db);
-    // Fresh defaults: a leftover admin-console settings document must not
-    // flip consent (or anything else) off for this scenario.
-    await requireDb().deleteFrom("settings").where("key", "=", "global").execute();
+    scratch = await createScratchDb("e2e_booking_skill");
+    db = scratch.db;
 
     // Ephemeral port: nothing fixed to collide with across suite runs.
     calendar = await startMockCalendar();
@@ -1157,20 +1140,9 @@ describe.skipIf(!DATABASE_URL)("e2e: booking skill over the browser transport (t
       if (handle) await handle.close();
     } finally {
       await calendar?.stop();
-      if (db) {
-        // calls row delete cascades to transcripts, notes and events.
-        await db
-          .deleteFrom("calls")
-          .where((eb) =>
-            eb.or([
-              eb("call_sid", "=", callSid ?? "__none__"),
-              eb("from_number", "=", BOOKING_FROM),
-            ]),
-          )
-          .execute();
-        await db.deleteFrom("settings").where("key", "=", "global").execute();
-        await closeDb(db);
-      }
+      // Dropping the scratch database removes the fixture calls row and
+      // everything cascaded to it — no shared-table deletes.
+      if (scratch) await scratch.destroy();
     }
   });
 
@@ -1280,6 +1252,10 @@ const ESCALATION_REASON = "Caller asked for a human colleague";
 describe.skipIf(!DATABASE_URL)(
   "e2e: browser-path escalation guardrail (tasks 5.3/8.2)",
   () => {
+    // Scratch database: the shared `settings` row deletion this suite used to
+    // perform (before AND after the run) wiped the operator's saved settings
+    // on every full-suite run — the isolated database makes it moot.
+    let scratch: ScratchDb | undefined;
     let db: Kysely<Database> | undefined;
     let handle: AppHandle | undefined;
     let tts: ReturnType<typeof makeSilenceTts> | undefined;
@@ -1301,9 +1277,8 @@ describe.skipIf(!DATABASE_URL)(
     };
 
     beforeAll(async () => {
-      db = createDb(DATABASE_URL);
-      await runMigrations(db);
-      await requireDb().deleteFrom("settings").where("key", "=", "global").execute();
+      scratch = await createScratchDb("e2e_escalation_guard");
+      db = scratch.db;
 
       tts = makeSilenceTts();
       const config: AppConfig = configSchema.parse({
@@ -1365,19 +1340,9 @@ describe.skipIf(!DATABASE_URL)(
       try {
         if (handle) await handle.close();
       } finally {
-        if (db) {
-          await db
-            .deleteFrom("calls")
-            .where((eb) =>
-              eb.or([
-                eb("call_sid", "=", callSid ?? "__none__"),
-                eb("from_number", "=", ESCALATION_FROM),
-              ]),
-            )
-            .execute();
-          await db.deleteFrom("settings").where("key", "=", "global").execute();
-          await closeDb(db);
-        }
+        // Dropping the scratch database removes the fixture calls row and
+        // everything cascaded to it — no shared-table deletes.
+        if (scratch) await scratch.destroy();
       }
     });
 
@@ -1393,15 +1358,28 @@ describe.skipIf(!DATABASE_URL)(
 
     it("records calls.escalated, the escalation_triggered event and the session flag", async () => {
       const database = requireDb();
-      const call = await pollForDbRow(database, requireCallSid(), "completed");
-      expect(call.escalated).toBe(true);
+      // setCallEscalated + the escalation_triggered event are fire-and-forget
+      // writes (src/agent/escalation.ts) that can land just AFTER the row
+      // reads "completed" — poll for the settled state instead of asserting
+      // on a bare completed row.
+      const call = await pollForDb("escalated completed calls row", async () => {
+        const row = await database
+          .selectFrom("calls")
+          .selectAll()
+          .where("call_sid", "=", requireCallSid())
+          .executeTakeFirst();
+        return row !== undefined && row.status === "completed" && row.escalated ? row : undefined;
+      });
       expect(call.consent).toBe("granted");
 
-      const events = await database
-        .selectFrom("call_events")
-        .select(["type", "detail"])
-        .where("call_id", "=", call.id)
-        .execute();
+      const events = await pollForDb("escalation call_events rows", async () => {
+        const rows = await database
+          .selectFrom("call_events")
+          .select(["type", "detail"])
+          .where("call_id", "=", call.id)
+          .execute();
+        return rows.some((e) => e.type === "escalation_triggered") ? rows : undefined;
+      });
       const types = events.map((e) => e.type);
       const triggered = events.find((e) => e.type === "escalation_triggered");
       expect(triggered?.detail).toEqual({ reason: ESCALATION_REASON });

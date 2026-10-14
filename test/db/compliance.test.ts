@@ -1,7 +1,5 @@
 import type { Kysely } from "kysely";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { closeDb, createDb } from "../../src/db/client.js";
-import { runMigrations } from "../../src/db/migrate.js";
 import {
   getCallById,
   insertCall,
@@ -10,26 +8,23 @@ import {
   setCallEscalated,
 } from "../../src/db/queries.js";
 import type { Database } from "../../src/db/schema.js";
+import { createScratchDb, type ScratchDb } from "../helpers/scratch-db.js";
 
 const databaseUrl = process.env.DATABASE_URL;
 
 describe.skipIf(!databaseUrl)("db calls consent/escalated columns", () => {
+  // Scratch database: this suite writes calls rows; the isolated database
+  // keeps them (and the cleanup deletes below) away from the shared server.
+  let scratch: ScratchDb;
   let db: Kysely<Database>;
 
   beforeAll(async () => {
-    db = createDb(databaseUrl as string);
-    await runMigrations(db);
-    // Clean any leftovers from previous runs of this suite. Scoped to this
-    // suite's prefix — other suites use their own "test-<suite>-%" prefix and
-    // run against the same database in parallel.
-    await db.deleteFrom("calls").where("call_sid", "like", "test-compliance-%").execute();
+    scratch = await createScratchDb("db_compliance");
+    db = scratch.db;
   });
 
   afterAll(async () => {
-    if (db) {
-      await db.deleteFrom("calls").where("call_sid", "like", "test-compliance-%").execute();
-      await closeDb(db);
-    }
+    if (scratch) await scratch.destroy();
   });
 
   it("defaults to consent=null and escalated=false, setters update and read back", async () => {

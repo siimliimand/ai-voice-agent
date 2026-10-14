@@ -17,14 +17,11 @@
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import type { Kysely } from "kysely";
-import { describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { WebSocket } from "ws";
-
 import { getEscalationAnnouncement } from "../../src/agent/prompts/index.js";
 import { buildApp, type AppHandle } from "../../src/app.js";
 import { configSchema, type AppConfig } from "../../src/config/schema.js";
-import { closeDb, createDb } from "../../src/db/client.js";
-import { runMigrations } from "../../src/db/migrate.js";
 import type { Database } from "../../src/db/schema.js";
 import {
   OpenRouterClient,
@@ -38,6 +35,7 @@ import {
 } from "../../src/telephony/browser-transport.js";
 import type { SttEvent, SttProvider, SttStream, SttStreamOptions } from "../../src/stt/types.js";
 import type { TtsProvider, TtsStream } from "../../src/tts/types.js";
+import { createScratchDb, type ScratchDb } from "../helpers/scratch-db.js";
 
 const DATABASE_URL = process.env.DATABASE_URL ?? "";
 
@@ -287,59 +285,60 @@ describe("browser-transport escalation path (task 5.3)", () => {
 describe.skipIf(!DATABASE_URL)(
   "browser-transport escalation path persists the flag (task 5.3)",
   () => {
+    // Scratch database — this suite used to delete the shared `settings` row
+    // (key='global') on DATABASE_URL before and after the test, wiping the
+    // operator's saved settings on every run (the incident). The isolated
+    // database also keeps the calls/call_events fixture rows private.
+    let scratch: ScratchDb;
+    let db: Kysely<Database>;
+
+    beforeAll(async () => {
+      scratch = await createScratchDb("browser_escalation");
+      db = scratch.db;
+    });
+
+    afterAll(async () => {
+      if (scratch) await scratch.destroy();
+    });
+
     it("sets calls.escalated and writes the escalation_triggered event", async () => {
-      const db = createDb(DATABASE_URL);
+      const { handle, tts, callSid } = await runEscalationCall(db);
       try {
-        await runMigrations(db);
-        // A leftover admin-console settings document must not change the flow.
-        await db.deleteFrom("settings").where("key", "=", "global").execute();
+        expect(tts.sentences.join(" ")).toContain(getEscalationAnnouncement("en"));
 
-        const { handle, tts, callSid } = await runEscalationCall(db);
-        try {
-          expect(tts.sentences.join(" ")).toContain(getEscalationAnnouncement("en"));
+        const row = await waitFor("calls.escalated=true row", async () => {
+          const r = await db
+            .selectFrom("calls")
+            .selectAll()
+            .where("call_sid", "=", callSid)
+            .executeTakeFirst();
+          return r !== undefined && r.escalated && r.status === "completed" ? r : undefined;
+        });
 
-          const row = await waitFor("calls.escalated=true row", async () => {
-            const r = await db
-              .selectFrom("calls")
-              .selectAll()
-              .where("call_sid", "=", callSid)
-              .executeTakeFirst();
-            return r !== undefined && r.escalated && r.status === "completed" ? r : undefined;
-          });
-
-          // The call_ended event is inserted fire-and-forget right AFTER the
-          // calls row is finalized (which the waitFor above resolves on) —
-          // poll for it instead of racing the two-step finalization.
-          const events = await waitFor("call_ended event row", async () => {
-            const rows = await db
-              .selectFrom("call_events")
-              .select(["type", "detail"])
-              .where("call_id", "=", row.id)
-              .execute();
-            return rows.some((e) => e.type === "call_ended") ? rows : undefined;
-          });
-          const types = events.map((e) => e.type);
-          expect(types).toContain("escalation_triggered");
-          expect(events.find((e) => e.type === "escalation_triggered")?.detail).toEqual({
-            reason: ESCALATION_REASON,
-          });
-          // Escalation is the builtin, never a dispatched skill (design D7).
-          expect(types).not.toContain("skill_invocation");
-          // The call was finalized with the escalation hangup reason.
-          expect(events.find((e) => e.type === "call_ended")?.detail).toEqual({
-            reason: "escalated",
-          });
-        } finally {
-          await handle.close();
-          // The transcript writer's queued writes settle asynchronously; give
-          // them a beat so the cleanup delete below cannot race them (the
-          // scenario itself runs in single-digit milliseconds).
-          await sleep(100);
-          await db.deleteFrom("calls").where("call_sid", "=", callSid).execute();
-          await db.deleteFrom("settings").where("key", "=", "global").execute();
-        }
+        // The call_ended event is inserted fire-and-forget right AFTER the
+        // calls row is finalized (which the waitFor above resolves on) —
+        // poll for it instead of racing the two-step finalization.
+        const events = await waitFor("call_ended event row", async () => {
+          const rows = await db
+            .selectFrom("call_events")
+            .select(["type", "detail"])
+            .where("call_id", "=", row.id)
+            .execute();
+          return rows.some((e) => e.type === "call_ended") ? rows : undefined;
+        });
+        const types = events.map((e) => e.type);
+        expect(types).toContain("escalation_triggered");
+        expect(events.find((e) => e.type === "escalation_triggered")?.detail).toEqual({
+          reason: ESCALATION_REASON,
+        });
+        // Escalation is the builtin, never a dispatched skill (design D7).
+        expect(types).not.toContain("skill_invocation");
+        // The call was finalized with the escalation hangup reason.
+        expect(events.find((e) => e.type === "call_ended")?.detail).toEqual({
+          reason: "escalated",
+        });
       } finally {
-        await closeDb(db);
+        await handle.close();
       }
     });
   },

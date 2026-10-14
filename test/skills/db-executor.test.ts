@@ -1,9 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { closeDb, createDb } from "../../src/db/client.js";
-import { runMigrations } from "../../src/db/migrate.js";
-import { insertCall } from "../../src/db/queries.js";
 import type { Kysely } from "kysely";
 import type { Database } from "../../src/db/schema.js";
+import { insertCall } from "../../src/db/queries.js";
 import { ajv } from "../../src/skills/ajv.js";
 import { createDbExecutor } from "../../src/skills/db-executor.js";
 import { findSqlViolation } from "../../src/skills/sql-guard.js";
@@ -12,6 +10,7 @@ import { skillManifestSchema } from "../../src/skills/manifest.js";
 import { loadSkills } from "../../src/skills/loader.js";
 import type { LoadedSkill } from "../../src/skills/registry.js";
 import { fakeLogger, skillsConfig, withSkillDir } from "./helpers.js";
+import { createScratchDb, type ScratchDb } from "../helpers/scratch-db.js";
 
 describe("sql guard (load-time, no DB needed)", () => {
   it("accepts single SELECT/WITH statements, including a trailing semicolon", () => {
@@ -61,20 +60,18 @@ describe("db executor against real Postgres", () => {
   const SID = "test-skills-caabcdef1234567890";
 
   describe.skipIf(!databaseUrl)("bound-parameter SELECT execution", () => {
+    // Scratch database: the fixture call row lives on the isolated database.
+    let scratch: ScratchDb;
     let db: Kysely<Database>;
 
     beforeAll(async () => {
-      db = createDb(databaseUrl as string);
-      await runMigrations(db);
-      await db.deleteFrom("calls").where("call_sid", "like", "test-skills-%").execute();
+      scratch = await createScratchDb("skills_db_executor");
+      db = scratch.db;
       await insertCall(db, { callSid: SID, from: "+37251234567", provider: "twilio" });
     });
 
     afterAll(async () => {
-      if (db) {
-        await db.deleteFrom("calls").where("call_sid", "like", "test-skills-%").execute();
-        await closeDb(db);
-      }
+      if (scratch) await scratch.destroy();
     });
 
     it("returns rows for a parameterized read-only manifest (2.4)", async () => {

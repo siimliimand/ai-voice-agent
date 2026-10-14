@@ -1,17 +1,15 @@
 import Fastify from "fastify";
 import type { FastifyInstance } from "fastify";
 import type { Kysely } from "kysely";
-import { sql } from "kysely";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { registerAdminApi, type MetricsResponseDto } from "../../src/api/routes.js";
 import { kyselyAdminDb } from "../../src/api/db.js";
 import { registerBasicAuth } from "../../src/auth/basic-auth.js";
 import { configSchema, type AppConfig } from "../../src/config/schema.js";
-import { closeDb, createDb } from "../../src/db/client.js";
 import { countCallsByStatus, finalizeCall, insertCall } from "../../src/db/queries.js";
-import { runMigrations } from "../../src/db/migrate.js";
 import { LATENCY_STAGES, MetricsRegistry } from "../../src/observability/metrics.js";
 import type { Database } from "../../src/db/schema.js";
+import { createScratchDb, type ScratchDb } from "../helpers/scratch-db.js";
 
 const USERNAME = "admin";
 const PASSWORD = "s3cret";
@@ -186,14 +184,12 @@ describe("GET /api/metrics (fake db)", () => {
 
 describe.skipIf(!databaseUrl)("GET /api/metrics (postgres db layer)", () => {
   const SID_PREFIX = "CA-metrics-test-";
-  // Scratch database: the assertions below expect EXACT per-status counts
-  // over the calls table, and other DB-backed suites insert calls into the
-  // shared database in parallel — an isolated database makes them
-  // deterministic.
-  let admin: Kysely<Database>;
+  // Scratch database (shared helper): the assertions below expect EXACT
+  // per-status counts over the calls table — an isolated database makes them
+  // deterministic and keeps the fixture rows off the shared server.
+  let scratch: ScratchDb;
   let db: Kysely<Database>;
   let app: FastifyInstance;
-  const SCRATCH_DB = "voice_metrics_api_test";
 
   const insertCallWithStatus = async (
     sid: string,
@@ -210,16 +206,9 @@ describe.skipIf(!databaseUrl)("GET /api/metrics (postgres db layer)", () => {
   };
 
   beforeAll(async () => {
-    admin = createDb(databaseUrl as string);
-    await sql`DROP DATABASE IF EXISTS ${sql.raw(SCRATCH_DB)} WITH (FORCE)`.execute(admin);
-    await sql`CREATE DATABASE ${sql.raw(SCRATCH_DB)}`.execute(admin);
-    const scratchUrl = new URL(databaseUrl as string);
-    scratchUrl.pathname = `/${SCRATCH_DB}`;
-    db = createDb(scratchUrl.toString());
-    await runMigrations(db);
-    // Idempotent cleanup of previous runs, then a fresh fixture set:
-    // 2 completed + 1 failed finals, plus 1 still-open row.
-    await db.deleteFrom("calls").where("call_sid", "like", `${SID_PREFIX}%`).execute();
+    scratch = await createScratchDb("metrics_api");
+    db = scratch.db;
+    // Fresh fixture set: 2 completed + 1 failed finals, plus 1 still-open row.
     await insertCallWithStatus(`${SID_PREFIX}completed-1`, "completed");
     await insertCallWithStatus(`${SID_PREFIX}completed-2`, "completed");
     await insertCallWithStatus(`${SID_PREFIX}failed-1`, "failed");
@@ -233,13 +222,8 @@ describe.skipIf(!databaseUrl)("GET /api/metrics (postgres db layer)", () => {
   });
 
   afterAll(async () => {
-    await db.deleteFrom("calls").where("call_sid", "like", `${SID_PREFIX}%`).execute();
     await app?.close();
-    if (db) await closeDb(db);
-    if (admin) {
-      await sql`DROP DATABASE IF EXISTS ${sql.raw(SCRATCH_DB)} WITH (FORCE)`.execute(admin);
-      await closeDb(admin);
-    }
+    if (scratch) await scratch.destroy();
   });
 
   it("groups the persisted rows per status (authoritative finals, D10)", async () => {

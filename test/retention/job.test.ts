@@ -2,8 +2,6 @@ import { createHash } from "node:crypto";
 import type { Kysely } from "kysely";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { configSchema, type AppConfig } from "../../src/config/schema.js";
-import { closeDb, createDb } from "../../src/db/client.js";
-import { runMigrations } from "../../src/db/migrate.js";
 import {
   getCallById,
   getNote,
@@ -15,6 +13,7 @@ import {
 } from "../../src/db/queries.js";
 import type { Database } from "../../src/db/schema.js";
 import { anonymizeNumber, RetentionJob } from "../../src/retention/index.js";
+import { createScratchDb, type ScratchDb } from "../helpers/scratch-db.js";
 
 const databaseUrl = process.env.DATABASE_URL;
 
@@ -31,28 +30,27 @@ const expectedAnon = (from: string): string =>
   `anon:${createHash("sha256").update(from + SALT).digest("hex").slice(0, 12)}`;
 
 describe.skipIf(!databaseUrl)("retention job", () => {
+  // Scratch database — MANDATORY here: RetentionJob.run() purges GLOBALLY
+  // (every call older than the window, not just test fixtures). Against the
+  // shared database it would anonymize real rows; the isolated database makes
+  // the purge a private no-op for everyone else.
+  let scratch: ScratchDb;
   let db: Kysely<Database>;
 
-  // FK cascades remove transcripts/notes/events with the call rows. Scoped
-  // to this suite's prefix — other suites use their own "test-<suite>-%"
-  // prefix and run against the same database in parallel.
+  // FK cascades remove transcripts/notes/events with the call rows.
   const clean = async (): Promise<void> => {
     await db.deleteFrom("calls").where("call_sid", "like", "test-retention-%").execute();
   };
 
   beforeAll(async () => {
-    db = createDb(databaseUrl as string);
-    await runMigrations(db);
-    await clean();
+    scratch = await createScratchDb("retention_job");
+    db = scratch.db;
   });
 
   afterEach(clean);
 
   afterAll(async () => {
-    if (db) {
-      await clean();
-      await closeDb(db);
-    }
+    if (scratch) await scratch.destroy();
   });
 
   /** Insert a call with 2 transcripts, 1 note and a call_started event. */

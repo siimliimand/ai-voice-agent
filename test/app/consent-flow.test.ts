@@ -23,9 +23,6 @@ import {
   getGreeting,
 } from "../../src/agent/prompts/index.js";
 import { configSchema, type AppConfig } from "../../src/config/schema.js";
-import { closeDb, createDb } from "../../src/db/client.js";
-import { runMigrations } from "../../src/db/migrate.js";
-import { SETTINGS_KEY } from "../../src/db/settings.js";
 import type { Database } from "../../src/db/schema.js";
 import { getTranscript } from "../../src/db/queries.js";
 import {
@@ -38,6 +35,7 @@ import type { SttEvent, SttProvider, SttStream, SttStreamOptions } from "../../s
 import type { CallTransport } from "../../src/telephony/transport.js";
 import type { CallInfo, Language } from "../../src/types.js";
 import type { TtsProvider, TtsStream } from "../../src/tts/types.js";
+import { createScratchDb, type ScratchDb } from "../helpers/scratch-db.js";
 
 const DATABASE_URL = process.env.DATABASE_URL ?? "";
 
@@ -222,8 +220,12 @@ async function waitFor<T>(desc: string, probe: () => T | undefined | Promise<T |
 /* ------------------------------------------------------------------ suite */
 
 describe.skipIf(!DATABASE_URL)("app: call-start consent flow (design D5)", () => {
+  // Scratch database — this suite used to delete the shared `settings` row
+  // (key='global') on DATABASE_URL before and after the run, wiping the
+  // operator's saved settings (the incident). The isolated database also
+  // keeps the calls/call_events fixture rows private.
+  let scratch: ScratchDb;
   let db: Kysely<Database>;
-  const usedCallSids: string[] = [];
   const openHandles: AppHandle[] = [];
 
   const requireDb = (): Kysely<Database> => {
@@ -255,7 +257,6 @@ describe.skipIf(!DATABASE_URL)("app: call-start consent flow (design D5)", () =>
   };
 
   const startCall = (handle: AppHandle, callSid: string, from: string): FakeTransport => {
-    usedCallSids.push(callSid);
     const transport = new FakeTransport(callSid, from);
     handle.startCallSession(transport);
     return transport;
@@ -284,24 +285,15 @@ describe.skipIf(!DATABASE_URL)("app: call-start consent flow (design D5)", () =>
   };
 
   beforeAll(async () => {
-    db = createDb(DATABASE_URL);
-    await runMigrations(db);
-    // Defaults for the effective-config resolver: a leftover admin-console
-    // settings document (e.g. consent disabled) from another suite must not
-    // leak into these scenarios.
-    await db.deleteFrom("settings").where("key", "=", SETTINGS_KEY).execute();
+    scratch = await createScratchDb("consent_flow");
+    db = scratch.db;
   });
 
   afterAll(async () => {
     try {
       while (openHandles.length > 0) await openHandles.pop()?.close();
-      if (usedCallSids.length > 0) {
-        // calls row delete cascades to transcripts, notes and events.
-        await db.deleteFrom("calls").where("call_sid", "in", usedCallSids).execute();
-        await db.deleteFrom("settings").where("key", "=", SETTINGS_KEY).execute();
-      }
     } finally {
-      await closeDb(db);
+      if (scratch) await scratch.destroy();
     }
   });
 

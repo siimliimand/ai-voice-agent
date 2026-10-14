@@ -2,7 +2,6 @@ import Fastify from "fastify";
 import pino from "pino";
 import type { FastifyInstance } from "fastify";
 import type { Kysely } from "kysely";
-import { sql } from "kysely";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   kyselySettingsDb,
@@ -15,10 +14,9 @@ import { EDITABLE_SECTIONS } from "../../src/config/editable.js";
 import { resolveEffectiveConfig } from "../../src/config/effective.js";
 import { deepMerge } from "../../src/config/index.js";
 import { configSchema, type AppConfig } from "../../src/config/schema.js";
-import { closeDb, createDb } from "../../src/db/client.js";
-import { runMigrations } from "../../src/db/migrate.js";
 import { deleteAtPath, getAtPath } from "../../src/db/settings.js";
 import type { Database } from "../../src/db/schema.js";
+import { createScratchDb, type ScratchDb } from "../helpers/scratch-db.js";
 
 const USERNAME = "admin";
 const PASSWORD = "s3cret";
@@ -293,36 +291,24 @@ describe("settings api (fake db)", () => {
 });
 
 describe.skipIf(!databaseUrl)("settings api (postgres)", () => {
-  // Scratch database on the same server: this suite reads/writes the shared
-  // `settings` row, which other DB-backed suites (consent flow) delete in
-  // parallel — an isolated database removes the cross-file race both ways.
-  let admin: Kysely<Database>;
+  // Scratch database (shared helper): this suite reads/writes the `settings`
+  // row — an isolated database removes the cross-file race both ways and can
+  // never touch operator data on the shared server.
+  let scratch: ScratchDb;
   let db: Kysely<Database>;
   let app: FastifyInstance;
-  const SCRATCH_DB = "voice_settings_api_test";
   const config = makeConfig();
 
   beforeAll(async () => {
-    admin = createDb(databaseUrl as string);
-    await sql`DROP DATABASE IF EXISTS ${sql.raw(SCRATCH_DB)} WITH (FORCE)`.execute(admin);
-    await sql`CREATE DATABASE ${sql.raw(SCRATCH_DB)}`.execute(admin);
-    const scratchUrl = new URL(databaseUrl as string);
-    scratchUrl.pathname = `/${SCRATCH_DB}`;
-    db = createDb(scratchUrl.toString());
-    await runMigrations(db);
-    await db.deleteFrom("settings").where("key", "=", "global").execute();
+    scratch = await createScratchDb("settings_api");
+    db = scratch.db;
     app = buildApp(kyselySettingsDb(db), config);
     await app.ready();
   });
 
   afterAll(async () => {
-    await db.deleteFrom("settings").where("key", "=", "global").execute();
     await app?.close();
-    if (db) await closeDb(db);
-    if (admin) {
-      await sql`DROP DATABASE IF EXISTS ${sql.raw(SCRATCH_DB)} WITH (FORCE)`.execute(admin);
-      await closeDb(admin);
-    }
+    if (scratch) await scratch.destroy();
   });
 
   it("persists a PUT, reflects it on GET and in the effective config", async () => {

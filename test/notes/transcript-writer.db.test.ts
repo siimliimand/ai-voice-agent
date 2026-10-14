@@ -6,12 +6,11 @@
 
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { Kysely } from "kysely";
-import { closeDb, createDb } from "../../src/db/client.js";
-import { runMigrations } from "../../src/db/migrate.js";
 import { getTranscript, insertCall } from "../../src/db/queries.js";
 import type { Database } from "../../src/db/schema.js";
 import type { Logger } from "../../src/logging.js";
 import { TranscriptWriter } from "../../src/notes/transcript-writer.js";
+import { createScratchDb, type ScratchDb } from "../helpers/scratch-db.js";
 
 const databaseUrl = process.env.DATABASE_URL;
 
@@ -23,19 +22,18 @@ const silentLogger = {
 } as unknown as Logger;
 
 describe.skipIf(!databaseUrl)("TranscriptWriter (real db)", () => {
+  // Scratch database: the fixture call rows (and the writer's transcript
+  // inserts) stay on the isolated database, never the shared server.
+  let scratch: ScratchDb;
   let db: Kysely<Database>;
 
   beforeAll(async () => {
-    db = createDb(databaseUrl as string);
-    await runMigrations(db);
-    await db.deleteFrom("calls").where("call_sid", "like", "test-writer-%").execute();
+    scratch = await createScratchDb("transcript_writer_db");
+    db = scratch.db;
   });
 
   afterAll(async () => {
-    if (db) {
-      await db.deleteFrom("calls").where("call_sid", "like", "test-writer-%").execute();
-      await closeDb(db);
-    }
+    if (scratch) await scratch.destroy();
   });
 
   it("persists utterances round-trip and survives the call-id race", async () => {

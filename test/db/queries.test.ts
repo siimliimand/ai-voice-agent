@@ -1,6 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { closeDb, createDb } from "../../src/db/client.js";
-import { runMigrations } from "../../src/db/migrate.js";
+import type { Kysely } from "kysely";
 import {
   finalizeCall,
   getCallById,
@@ -13,28 +12,24 @@ import {
   listCalls,
   upsertNote,
 } from "../../src/db/queries.js";
-import type { Kysely } from "kysely";
 import type { Database } from "../../src/db/schema.js";
+import { createScratchDb, type ScratchDb } from "../helpers/scratch-db.js";
 
 const databaseUrl = process.env.DATABASE_URL;
 
 describe.skipIf(!databaseUrl)("db queries", () => {
+  // Scratch database: this suite writes calls/transcripts/notes/events rows;
+  // the isolated database keeps them away from the shared server.
+  let scratch: ScratchDb;
   let db: Kysely<Database>;
 
   beforeAll(async () => {
-    db = createDb(databaseUrl as string);
-    await runMigrations(db);
-    // Clean any leftovers from previous runs of this suite. Scoped to this
-    // suite's prefix — other suites (e.g. transcript-writer) use their own
-    // "test-<suite>-%" prefix and run against the same database in parallel.
-    await db.deleteFrom("calls").where("call_sid", "like", "test-queries-%").execute();
+    scratch = await createScratchDb("db_queries");
+    db = scratch.db;
   });
 
   afterAll(async () => {
-    if (db) {
-      await db.deleteFrom("calls").where("call_sid", "like", "test-queries-%").execute();
-      await closeDb(db);
-    }
+    if (scratch) await scratch.destroy();
   });
 
   it("round-trips a call end to end", async () => {

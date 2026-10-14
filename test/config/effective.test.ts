@@ -1,6 +1,5 @@
 import pino from "pino";
 import type { Kysely } from "kysely";
-import { sql } from "kysely";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { deepMerge } from "../../src/config/index.js";
 import { EDITABLE_PATHS, EDITABLE_SECTIONS, isEditablePath } from "../../src/config/editable.js";
@@ -11,10 +10,9 @@ import {
 } from "../../src/config/effective.js";
 import { configSchema, type AppConfig } from "../../src/config/schema.js";
 import { maskSecretValues } from "../../src/api/settings.js";
-import { closeDb, createDb } from "../../src/db/client.js";
-import { runMigrations } from "../../src/db/migrate.js";
 import { deleteAtPath, getAtPath, saveSettingsDoc, setAtPath } from "../../src/db/settings.js";
 import type { Database } from "../../src/db/schema.js";
+import { createScratchDb, type ScratchDb } from "../helpers/scratch-db.js";
 
 const silent = pino({ level: "silent" });
 const databaseUrl = process.env.DATABASE_URL;
@@ -179,31 +177,19 @@ describe("EffectiveConfigResolver cache (stub db)", () => {
 });
 
 describe.skipIf(!databaseUrl)("resolveEffectiveConfig (postgres)", () => {
-  // Scratch database on the same server: this suite WRITES the settings doc
-  // for its whole run, and other DB-backed suites (settings API, consent
-  // flow) delete the shared `settings` row in parallel — a cross-file race
-  // that made the TTL test below flaky. An isolated database removes both
-  // directions.
-  let admin: Kysely<Database>;
+  // Scratch database (shared helper): this suite WRITES the settings doc
+  // for its whole run — an isolated database removes any cross-file race
+  // with other DB-backed suites and can never touch operator data.
+  let scratch: ScratchDb;
   let db: Kysely<Database>;
-  const SCRATCH_DB = "voice_effective_config_test";
 
   beforeAll(async () => {
-    admin = createDb(databaseUrl as string);
-    await sql`DROP DATABASE IF EXISTS ${sql.raw(SCRATCH_DB)} WITH (FORCE)`.execute(admin);
-    await sql`CREATE DATABASE ${sql.raw(SCRATCH_DB)}`.execute(admin);
-    const scratchUrl = new URL(databaseUrl as string);
-    scratchUrl.pathname = `/${SCRATCH_DB}`;
-    db = createDb(scratchUrl.toString());
-    await runMigrations(db);
+    scratch = await createScratchDb("effective_config");
+    db = scratch.db;
   });
 
   afterAll(async () => {
-    if (db) await closeDb(db);
-    if (admin) {
-      await sql`DROP DATABASE IF EXISTS ${sql.raw(SCRATCH_DB)} WITH (FORCE)`.execute(admin);
-      await closeDb(admin);
-    }
+    if (scratch) await scratch.destroy();
   });
 
   it("deep-merges the stored doc over the base config (base <- DB)", async () => {

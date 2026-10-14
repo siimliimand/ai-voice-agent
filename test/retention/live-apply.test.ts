@@ -18,14 +18,10 @@
  */
 import { createHash } from "node:crypto";
 import type { Kysely } from "kysely";
-import { sql } from "kysely";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { buildApp, type AppHandle } from "../../src/app.js";
 import { configSchema, type AppConfig } from "../../src/config/schema.js";
-import { closeDb, createDb } from "../../src/db/client.js";
-import { runMigrations } from "../../src/db/migrate.js";
-import { SETTINGS_KEY } from "../../src/db/settings.js";
 import {
   getCallById,
   getNote,
@@ -36,11 +32,9 @@ import {
 } from "../../src/db/queries.js";
 import type { Database } from "../../src/db/schema.js";
 import type { RetentionRunSummary } from "../../src/retention/index.js";
+import { createScratchDb, type ScratchDb } from "../helpers/scratch-db.js";
 
 const databaseUrl = process.env.DATABASE_URL;
-
-/** Scratch database on the same server; dropped (with FORCE) before/after. */
-const SCRATCH_DB = "voice_retention_live_apply";
 
 const ADMIN_USER = "admin";
 const ADMIN_PASSWORD = "live-apply-admin";
@@ -57,7 +51,11 @@ const expectedAnon = (from: string): string =>
 const daysAgo = (days: number): Date => new Date(Date.now() - days * 24 * 60 * 60 * 1000);
 
 describe.skipIf(!databaseUrl)("retention settings live-apply", () => {
-  let admin: Kysely<Database>; // default DB; only creates/drops the scratch database
+  // Scratch database (shared helper). The retention job purges GLOBALLY, so
+  // sharing the default test database would let this suite eat other suites'
+  // backdated fixtures mid-flight (and a shared settings row would race the
+  // settings API suite).
+  let scratch: ScratchDb;
   let db: Kysely<Database>; // the scratch database the app under test uses
   let handle: AppHandle;
 
@@ -92,13 +90,8 @@ describe.skipIf(!databaseUrl)("retention settings live-apply", () => {
   }
 
   beforeAll(async () => {
-    admin = createDb(databaseUrl as string);
-    await sql`DROP DATABASE IF EXISTS ${sql.raw(SCRATCH_DB)} WITH (FORCE)`.execute(admin);
-    await sql`CREATE DATABASE ${sql.raw(SCRATCH_DB)}`.execute(admin);
-    const scratchUrl = new URL(databaseUrl as string);
-    scratchUrl.pathname = `/${SCRATCH_DB}`;
-    db = createDb(scratchUrl.toString());
-    await runMigrations(db);
+    scratch = await createScratchDb("retention_live_apply");
+    db = scratch.db;
     // retention disabled in the BASE config: the job's startup run is a
     // deterministic no-op, so only the saved settings can arm a purge.
     const baseConfig: AppConfig = configSchema.parse({
@@ -110,16 +103,10 @@ describe.skipIf(!databaseUrl)("retention settings live-apply", () => {
   });
 
   afterAll(async () => {
-    if (db) {
-      await db.deleteFrom("calls").where("call_sid", "like", "test-retention-live-%").execute();
-      await db.deleteFrom("settings").where("key", "=", SETTINGS_KEY).execute();
-    }
     await handle?.close();
-    if (db) await closeDb(db);
-    if (admin) {
-      await sql`DROP DATABASE IF EXISTS ${sql.raw(SCRATCH_DB)} WITH (FORCE)`.execute(admin);
-      await closeDb(admin);
-    }
+    // Dropping the scratch database removes the fixture calls/settings rows —
+    // no shared-table deletes.
+    if (scratch) await scratch.destroy();
   });
 
   it("a saved retention.days/enabled/hashSalt applies on the next run without a restart", async () => {
