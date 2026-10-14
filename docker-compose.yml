@@ -5,7 +5,8 @@ services:
     build: .
     restart: unless-stopped
     ports:
-      - "${PORT:-3000}:${PORT:-3000}"
+      # Prod: nginx proxies 443 -> this. Bind loopback ONLY; never expose 0.0.0.0.
+      - "127.0.0.1:3000:3000"
     environment:
       # All runtime configuration comes from .env (see .env.example).
       - DATABASE_URL=postgres://voice:voice@postgres:5432/voice

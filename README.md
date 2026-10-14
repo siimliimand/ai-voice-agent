@@ -563,6 +563,9 @@ npm run test:e2e
 
 ## Deployment
 
+> **Production runbook for the live server** (this host): see
+> [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
+
 ```bash
 docker compose up -d --build
 ```
