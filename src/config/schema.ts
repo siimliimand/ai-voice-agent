@@ -41,7 +41,10 @@ export const configSchema = z.object({
   tts: z
     .object({
       provider: z.enum(["elevenlabs", "azure"]).default("elevenlabs"),
-      model: z.string().default("eleven_v3"),
+      // NOTE: eleven_v3 is NOT supported by the stream-input WebSocket
+      // endpoint (handshake 400) — use it via HTTP TTS only. stream-input
+      // accepts turbo/flash/multilingual v2 models (verified 2026-10).
+      model: z.string().default("eleven_turbo_v2_5"),
       voiceEt: z.string().default("pqHfZKP75CvOlQylNhV4"),
       voiceRu: z.string().default("pFZP5JQG7iQjIQuC4Bku"),
       voiceEn: z.string().default("21m00Tcm4TlvDq8ikWAM"),

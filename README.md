@@ -279,7 +279,7 @@ present) and uses the same field names as the zod schema in
 | `STT_SAMPLE_RATE_HZ` | `16000` | PCM sample rate fed into the pipeline core |
 | **TTS** | | |
 | `TTS_PROVIDER` | `elevenlabs` | `elevenlabs` (the `azure` fallback is a documented contingency — adapter not implemented) |
-| `TTS_MODEL` | `eleven_v3` | ElevenLabs model id |
+| `TTS_MODEL` | `eleven_turbo_v2_5` | ElevenLabs model id |
 | `TTS_VOICE_ET` / `_RU` / `_EN` | `pqHfZKP75CvOlQylNhV4` / `pFZP5JQG7iQjIQuC4Bku` / `21m00Tcm4TlvDq8ikWAM` | Voice id per language (must support the language) |
 | `TTS_OUTPUT_SAMPLE_RATE_HZ` | `16000` | Synthesized-audio sample rate |
 | **Provider keys** | | |
