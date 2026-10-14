@@ -108,6 +108,13 @@ export const EDITABLE_SECTIONS: EditableSection[] = [
     title: "Text-to-speech",
     fields: [
       { path: "tts.provider", label: "Provider", type: "select", options: ["elevenlabs"] },
+      {
+        path: "tts.api",
+        label: "ElevenLabs API transport",
+        type: "select",
+        options: ["auto", "tts", "dialogue"],
+        help: "auto picks by model family: Eleven v3/v4 models (eleven_v3*, eleven_v4*) stream over the text-to-dialogue API; other models use the classic text-to-speech stream API. Forcing a transport that the model does not support fails the stream.",
+      },
       { path: "tts.model", label: "Model", type: "string" },
       { path: "tts.voiceEt", label: "Estonian voice", type: "string" },
       { path: "tts.voiceRu", label: "Russian voice", type: "string" },

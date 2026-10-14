@@ -44,6 +44,23 @@ describe("config schema: M4 section defaults", () => {
   });
 });
 
+describe("config schema: tts.api transport selection", () => {
+  it("defaults to auto (transport picked by model family)", () => {
+    expect(configSchema.parse({}).tts.api).toBe("auto");
+  });
+
+  it("parses TTS_API from the environment", () => {
+    expect(fromEnv({ TTS_API: "dialogue" }).tts.api).toBe("dialogue");
+    expect(fromEnv({ TTS_API: "tts" }).tts.api).toBe("tts");
+    expect(fromEnv({ TTS_API: "auto" }).tts.api).toBe("auto");
+  });
+
+  it("rejects unknown transports", () => {
+    expect(configSchema.safeParse({ tts: { api: "grpc" } }).success).toBe(false);
+    expect(() => fromEnv({ TTS_API: "grpc" })).toThrow();
+  });
+});
+
 describe("config schema: M4 values from environment", () => {
   it("parses the new sections from env vars into their nested paths", () => {
     const c = fromEnv({

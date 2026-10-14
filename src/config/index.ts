@@ -54,6 +54,7 @@ function mapEnv(env: NodeJS.ProcessEnv): Record<string, unknown> {
 
   out.tts = pick(env, {
     provider: "TTS_PROVIDER",
+    api: "TTS_API",
     model: "TTS_MODEL",
     voiceEt: "TTS_VOICE_ET",
     voiceRu: "TTS_VOICE_RU",

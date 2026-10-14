@@ -91,6 +91,17 @@ feeding the same `VoicePipeline`; sessions are held in memory by
 `CallSessionManager` with incremental persistence to Postgres as the
 recovery point.
 
+**TTS transports** — the pipeline speaks one sentence per TTS stream, and the
+stream class is chosen from `tts.api` without any pipeline changes: v2.x
+models (default `eleven_turbo_v2_5`) stream over the ElevenLabs
+text-to-speech `stream-input` WebSocket, while `eleven_v3`/`eleven_v4` models
+(incl. `eleven_v4_turbo`) stream over the text-to-dialogue WebSocket — the
+only endpoint that accepts them (registering the voice first, then one
+flushed `{inputs, flush: true}` turn per sentence for low first-byte
+latency, with a 15 s keep-alive for idle sockets). Barge-in has no cancel
+message on either transport: the pipeline simply closes the socket, and the
+~100-120 ms handshake makes a socket-per-sentence lifecycle viable.
+
 **M4 additions** (skills + compliance change):
 
 - **Consent-gated call start** — with `consent.enabled`, a spoken notice
@@ -129,7 +140,7 @@ recovery point.
 | Build approach | Custom orchestrator (not ElevenLabs Conversational AI) | Full control of prompts, data, latency, and future tools |
 | Transport | `CallTransport` interface: **TwilioMediaStream** (prod) + **Browser** (dev) | 100% of the pipeline is shared; dev needs no telephony |
 | STT | ElevenLabs **Scribe v2 Realtime** default; Soniox/Gladia adapters ship too | Streaming, ~150 ms partials, et/ru/en — Estonian is only in ElevenLabs' "good" WER tier, so the bake-off (operator-pending) decides the final provider |
-| TTS | ElevenLabs **Eleven v3** | Flash v2.5 does **not** support Estonian; v3 covers all three languages. The Azure `et-EE` fallback is a documented contingency — the adapter is **not implemented** (`TTS_PROVIDER=azure` throws) |
+| TTS | ElevenLabs: **text-to-speech stream-input** for v2.x models, **text-to-dialogue** for Eleven v3/v4 (`tts.api=auto` picks by model family) | v3/v4 models are rejected by the stream-input endpoint (HTTP 400 `unsupported_model`); they only stream over text-to-dialogue. The Azure `et-EE` fallback is a documented contingency — the adapter is **not implemented** (`TTS_PROVIDER=azure` throws) |
 | LLM | **OpenRouter**, model per role (conversation / summarizer / utility) + per-language overrides | All AI models are configurable without code changes |
 | Languages | Hybrid detect-then-lock: detect on first utterance, lock STT + voice + prompt, re-detect on switch | Continuous auto-detect misfires on short Estonian utterances |
 | Data | Transcripts only — **no raw call audio stored** | GDPR-minimal by design |
@@ -150,7 +161,7 @@ src/
 ├── telephony/       # CallTransport interface; twilio/ (TwiML webhook, signature check, media WS), browser-transport
 ├── audio/           # μ-law↔PCM, resampling, PCM framing, VAD, playback queue
 ├── stt/             # SttProvider interface + scribe / soniox / gladia adapters
-├── tts/             # TtsProvider interface, sentence chunker, ElevenLabs adapter
+├── tts/             # TtsProvider interface, sentence chunker, ElevenLabs adapters (stream-input + text-to-dialogue)
 ├── llm/             # OpenRouter streaming client + model-per-role resolution
 ├── agent/           # conversation manager, language detect/lock, prompts (et/ru/en), voice registry, tool loop + confirmation, escalation
 ├── skills/          # YAML manifests → tool definitions, dispatcher (ajv validation, confirmation policy, audit), http/db executors
@@ -279,7 +290,8 @@ present) and uses the same field names as the zod schema in
 | `STT_SAMPLE_RATE_HZ` | `16000` | PCM sample rate fed into the pipeline core |
 | **TTS** | | |
 | `TTS_PROVIDER` | `elevenlabs` | `elevenlabs` (the `azure` fallback is a documented contingency — adapter not implemented) |
-| `TTS_MODEL` | `eleven_turbo_v2_5` | ElevenLabs model id |
+| `TTS_API` | `auto` | Which ElevenLabs websocket transport: `auto` picks by model family — `eleven_v3`/`eleven_v4` models require `text-to-dialogue`, v2.x models use `text-to-speech` stream-input; forcing a mismatching transport fails the stream with a clear error |
+| `TTS_MODEL` | `eleven_turbo_v2_5` | ElevenLabs model id — **`eleven_v3*` / `eleven_v4*` (incl. `eleven_v4_turbo`) require the text-to-dialogue API** (the stream-input WS rejects them with HTTP 400 `unsupported_model`) |
 | `TTS_VOICE_ET` / `_RU` / `_EN` | `pqHfZKP75CvOlQylNhV4` / `pFZP5JQG7iQjIQuC4Bku` / `21m00Tcm4TlvDq8ikWAM` | Voice id per language (must support the language) |
 | `TTS_OUTPUT_SAMPLE_RATE_HZ` | `16000` | Synthesized-audio sample rate |
 | **Provider keys** | | |
@@ -505,9 +517,9 @@ emits tool calls. Exits 1 if any model fails to stream; skips cleanly without
 
 ### Testing
 
-Current state: **515 tests green across 59 suites, 0 skipped** (unit,
-language, and e2e) with `DATABASE_URL` set; without it, 48 tests in 8
-DB-backed suites skip cleanly (exit still 0).
+Current state: **563 tests green across 60 suites, 0 skipped** (unit,
+language, and e2e) with `DATABASE_URL` set; without it, DB-backed suites skip
+cleanly (exit still 0).
 
 | Level | What | Command | Notes |
 |---|---|---|---|

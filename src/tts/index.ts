@@ -1,14 +1,23 @@
 import type { AppConfig } from "../config/schema.js";
+import { ElevenLabsDialogueTtsProvider, resolveTtsTransport } from "./elevenlabs-dialogue.js";
 import { ElevenLabsTtsProvider } from "./elevenlabs.js";
 import type { TtsProvider } from "./types.js";
 
 export * from "./types.js";
 export { chunkSentences, DEFAULT_MIN_SENTENCE_LENGTH, SentenceChunker } from "./sentence.js";
 export { ElevenLabsTtsProvider } from "./elevenlabs.js";
+export {
+  ElevenLabsDialogueTtsProvider,
+  isDialogueFamilyModel,
+  resolveTtsTransport,
+} from "./elevenlabs-dialogue.js";
 
 /**
  * Create the TTS provider selected by config.tts.provider. Throws a clear
- * Error naming the missing environment variable when no API key is set.
+ * Error naming the missing environment variable when no API key is set, or
+ * when tts.api forces a transport the configured model family cannot use
+ * (Eleven v3/v4 models only stream over the text-to-dialogue API; v2.x
+ * models only stream over text-to-speech stream-input).
  */
 export function createTtsProvider(config: AppConfig): TtsProvider {
   switch (config.tts.provider) {
@@ -18,7 +27,10 @@ export function createTtsProvider(config: AppConfig): TtsProvider {
           'TTS provider "elevenlabs" requires an ElevenLabs API key: set the ELEVENLABS_API_KEY environment variable (or config.elevenlabs.apiKey).',
         );
       }
-      return new ElevenLabsTtsProvider(config);
+      const transport = resolveTtsTransport(config.tts.api, config.tts.model);
+      return transport === "dialogue"
+        ? new ElevenLabsDialogueTtsProvider(config)
+        : new ElevenLabsTtsProvider(config);
     }
     case "azure":
       // Azure Neural TTS fallback: planned contingency if ElevenLabs quality

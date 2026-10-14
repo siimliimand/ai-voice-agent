@@ -3,6 +3,7 @@ import WebSocket from "ws";
 import type { AppConfig } from "../config/schema.js";
 import { logger, type Logger } from "../logging.js";
 import { closeWebSocket, rawDataToText } from "../stt/ws-common.js";
+import { isDialogueFamilyModel } from "./elevenlabs-dialogue.js";
 import type { TtsProvider, TtsRequest, TtsStream } from "./types.js";
 
 /** ElevenLabs public API WebSocket base. */
@@ -42,6 +43,16 @@ export class ElevenLabsTtsProvider implements TtsProvider {
   }
 
   stream(req: TtsRequest): TtsStream {
+    // The stream-input endpoint rejects Eleven v3/v4 models at handshake
+    // (HTTP 400 unsupported_model, by official design) — they only stream
+    // over the text-to-dialogue transport (see elevenlabs-dialogue.ts).
+    const modelId = req.modelId ?? this.defaultModel;
+    if (isDialogueFamilyModel(modelId)) {
+      throw new Error(
+        `ElevenLabs model "${modelId}" only streams over the text-to-dialogue API ` +
+          `(the text-to-speech stream-input endpoint rejects it) — set tts.api to "auto" or "dialogue".`,
+      );
+    }
     return new ElevenLabsTtsStream(req, {
       apiKey: this.apiKey,
       defaultModel: this.defaultModel,

@@ -41,9 +41,18 @@ export const configSchema = z.object({
   tts: z
     .object({
       provider: z.enum(["elevenlabs", "azure"]).default("elevenlabs"),
-      // NOTE: eleven_v3 is NOT supported by the stream-input WebSocket
-      // endpoint (handshake 400) — use it via HTTP TTS only. stream-input
-      // accepts turbo/flash/multilingual v2 models (verified 2026-10).
+      /**
+       * Which ElevenLabs websocket transport carries TTS. "auto" picks by
+       * model family: models starting with eleven_v3/eleven_v4 are rejected
+       * by the text-to-speech stream-input endpoint (handshake 400
+       * unsupported_model) and stream over the text-to-dialogue endpoint
+       * instead; v2.x models use stream-input. "tts"/"dialogue" force one
+       * transport (mismatch with the model family fails the stream creation
+       * with a clear error).
+       */
+      api: z.enum(["auto", "tts", "dialogue"]).default("auto"),
+      // eleven_v3/eleven_v4 models require tts.api=auto|dialogue (they only
+      // stream over the text-to-dialogue websocket, verified 2026-10-14).
       model: z.string().default("eleven_turbo_v2_5"),
       voiceEt: z.string().default("pqHfZKP75CvOlQylNhV4"),
       voiceRu: z.string().default("pFZP5JQG7iQjIQuC4Bku"),
