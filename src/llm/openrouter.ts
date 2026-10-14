@@ -4,10 +4,25 @@
  * this client; model ids are selected per role/language via resolve-model.ts.
  */
 
+/** A tool call made by the assistant (OpenAI chat-completions shape). */
+export interface ToolCallRequest {
+  id: string;
+  type: "function";
+  function: {
+    name: string;
+    /** JSON-encoded arguments string (not a parsed object), per the API. */
+    arguments: string;
+  };
+}
+
 /** One message of a chat completion request. */
 export interface ChatMessage {
   role: "system" | "user" | "assistant" | "tool";
   content: string;
+  /** Assistant messages only: tool calls requested in this turn (echoed back verbatim when continuing after tool results). */
+  tool_calls?: ToolCallRequest[];
+  /** Tool messages only: id of the tool call this message answers. */
+  tool_call_id?: string;
 }
 
 /** One streamed chunk of a chat completion. */
@@ -16,6 +31,13 @@ export interface StreamDelta {
   finishReason?: string | null;
   /** Present when the model streams tool-call arguments. */
   toolCalls?: ToolCallDelta[];
+  /**
+   * Only on the final delta (the one carrying `finishReason`): every tool call
+   * streamed in this completion, accumulated by index from the raw fragments
+   * above (`id`/`name` from the first fragment, `arguments` concatenated in
+   * arrival order). Absent on plain streams that carry no tool-call deltas.
+   */
+  completedToolCalls?: CompletedToolCall[];
 }
 
 /** Incremental tool_call entry as streamed by the API. */
@@ -24,6 +46,14 @@ export interface ToolCallDelta {
   id?: string;
   type?: string;
   function?: { name?: string; arguments?: string };
+}
+
+/** A complete tool call assembled from a stream's tool-call deltas. */
+export interface CompletedToolCall {
+  id: string;
+  name: string;
+  /** JSON-encoded arguments string, ready for JSON.parse by the caller. */
+  arguments: string;
 }
 
 /** OpenAI function-tool definition passed through to the API. */
@@ -109,6 +139,8 @@ export class OpenRouterClient {
   /**
    * Stream a chat completion, yielding content deltas (and tool-call deltas
    * when requested) followed by a final chunk carrying the finish reason.
+   * When any tool-call deltas were streamed, the final chunk also carries
+   * `completedToolCalls` — the calls assembled from those fragments.
    * SSE comment/keep-alive lines (e.g. ": OPENROUTER PROCESSING") are ignored
    * and the "[DONE]" terminator ends the stream.
    */
@@ -130,6 +162,10 @@ export class OpenRouterClient {
     if (!response.body) {
       throw new Error(`OpenRouter returned an empty body for model ${opts.model}`);
     }
+    // Tool-call accumulation is lazy: the accumulator only exists once a
+    // tool-call delta arrives, so plain (tool-free) streams keep today's
+    // per-chunk work and event shapes untouched.
+    let toolCallAccumulator: ToolCallAccumulator | null = null;
     for await (const line of sseLines(response.body)) {
       if (line === "" || line.startsWith(":")) continue; // keep-alive comments
       if (!line.startsWith("data:")) continue;
@@ -142,7 +178,17 @@ export class OpenRouterClient {
         continue; // tolerate a partial/garbled frame rather than killing the stream
       }
       const delta = streamDeltaFrom(chunk, opts.model);
-      if (delta) yield delta;
+      if (!delta) continue;
+      if (delta.toolCalls) {
+        toolCallAccumulator ??= new Map();
+        for (const fragment of delta.toolCalls) {
+          accumulateToolCallFragment(toolCallAccumulator, fragment);
+        }
+      }
+      if (delta.finishReason != null && toolCallAccumulator !== null) {
+        delta.completedToolCalls = completedToolCalls(toolCallAccumulator);
+      }
+      yield delta;
     }
   }
 
@@ -198,6 +244,43 @@ export class OpenRouterClient {
         (snippet ? ` — ${snippet}` : ""),
     );
   }
+}
+
+/** In-progress tool call keyed by its streamed index. */
+type ToolCallAccumulator = Map<number, { id?: string; name?: string; arguments: string }>;
+
+/**
+ * Fold one streamed tool-call fragment into the accumulator. Fragments arrive
+ * keyed by `index`: the first carries `id`/`name`, later ones append argument
+ * string fragments in arrival order (OpenAI chat-completions streaming shape).
+ */
+function accumulateToolCallFragment(acc: ToolCallAccumulator, fragment: ToolCallDelta): void {
+  const key = typeof fragment.index === "number" ? fragment.index : acc.size;
+  const existing = acc.get(key);
+  if (!existing) {
+    acc.set(key, {
+      id: fragment.id,
+      name: fragment.function?.name,
+      arguments: fragment.function?.arguments ?? "",
+    });
+    return;
+  }
+  if (existing.id === undefined && fragment.id !== undefined) existing.id = fragment.id;
+  if (existing.name === undefined && fragment.function?.name !== undefined) {
+    existing.name = fragment.function.name;
+  }
+  if (fragment.function?.arguments) existing.arguments += fragment.function.arguments;
+}
+
+/** Snapshot the accumulator as complete calls, ordered by streamed index. */
+function completedToolCalls(acc: ToolCallAccumulator): CompletedToolCall[] {
+  return [...acc.entries()]
+    .sort(([a], [b]) => a - b)
+    .map(([, call]) => ({
+      id: call.id ?? "",
+      name: call.name ?? "",
+      arguments: call.arguments,
+    }));
 }
 
 /**

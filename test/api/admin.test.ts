@@ -34,6 +34,8 @@ function makeCallRow(overrides: Partial<CallRow> = {}): CallRow {
     startedAt: STARTED_AT,
     endedAt: ENDED_AT,
     durationS: 150,
+    consent: null,
+    escalated: false,
     ...overrides,
   };
 }
@@ -42,7 +44,11 @@ function makeListItem(overrides: Partial<CallListItem> = {}): CallListItem {
   return { ...makeCallRow(), noteSummary: null, noteModel: null, ...overrides };
 }
 
-const ITEM_1: CallListItem = makeListItem({ noteSummary: LONG_SUMMARY, noteModel: "gpt-4o-mini" });
+const ITEM_1: CallListItem = makeListItem({
+  noteSummary: LONG_SUMMARY,
+  noteModel: "gpt-4o-mini",
+  consent: "granted",
+});
 const ITEM_2: CallListItem = makeListItem({
   id: 2,
   callSid: "CA1555550102",
@@ -52,6 +58,8 @@ const ITEM_2: CallListItem = makeListItem({
   endedAt: null,
   durationS: null,
   noteSummary: "<script>alert(1)</script>",
+  consent: "declined",
+  escalated: true,
 });
 
 const TRANSCRIPT: TranscriptRow[] = [
@@ -98,6 +106,7 @@ function makeFakeDb() {
     getCallBySid: vi.fn(async (_sid: string) => null),
     getTranscript: vi.fn(async (_callId: number) => TRANSCRIPT),
     getNote: vi.fn(async (_callId: number): Promise<NoteRow | null> => NOTE_ROW),
+    countCallsByStatus: vi.fn(async () => ({ in_progress: 1, completed: 1, failed: 0 })),
   };
 }
 type FakeDb = ReturnType<typeof makeFakeDb>;
@@ -210,6 +219,8 @@ describe("GET /api/calls", () => {
         "toNumber",
         "language",
         "status",
+        "consent",
+        "escalated",
         "startedAt",
         "endedAt",
         "durationS",
@@ -223,11 +234,16 @@ describe("GET /api/calls", () => {
       toNumber: "+37260000000",
       language: "et",
       status: "completed",
+      consent: "granted",
+      escalated: false,
       startedAt: STARTED_AT.toISOString(),
       endedAt: ENDED_AT.toISOString(),
       durationS: 150,
       noteExcerpt: LONG_SUMMARY,
     });
+
+    const second = body.calls[1]!;
+    expect(second).toMatchObject({ consent: "declined", escalated: true });
   });
 
   it("defaults to limit 50 / offset 0", async () => {
@@ -287,6 +303,8 @@ describe("GET /api/calls/:id", () => {
       callSid: "CA1555550101",
       provider: "twilio",
       durationS: 150,
+      consent: null,
+      escalated: false,
     });
     expect(body.transcript).toHaveLength(3);
     expect(body.transcript[0]).toEqual({
@@ -366,6 +384,25 @@ describe("GET /admin (call list page)", () => {
     expect(html).toContain("in progress"); // badge label of in_progress
   });
 
+  it("renders consent + escalated badges in the flags column (task 5.1)", async () => {
+    await app.ready();
+    const res = await app.inject({
+      method: "GET",
+      url: "/admin",
+      headers: { authorization: authHeader() },
+    });
+    expect(res.statusCode).toBe(200);
+    const html = res.body;
+
+    expect(html).toContain("<th>Flags</th>");
+    expect(html).toContain("badge-granted");
+    expect(html).toContain("consent granted");
+    expect(html).toContain("badge-declined");
+    expect(html).toContain("consent declined");
+    expect(html).toContain("badge-escalated");
+    expect(html).toContain("escalated");
+  });
+
   it("shows an empty state when there are no calls", async () => {
     db.listCalls.mockResolvedValue([]);
     await app.ready();
@@ -438,6 +475,33 @@ describe("GET /admin/calls/:id (detail page)", () => {
     });
     expect(res.statusCode).toBe(200);
     expect(res.body).toContain("No note yet");
+  });
+
+  it("renders consent + escalated rows in the metadata (task 5.1)", async () => {
+    db.getCallById.mockResolvedValue(makeCallRow({ consent: "granted", escalated: true }));
+    await app.ready();
+    const res = await app.inject({
+      method: "GET",
+      url: "/admin/calls/1",
+      headers: { authorization: authHeader() },
+    });
+    expect(res.statusCode).toBe(200);
+    const html = res.body;
+    expect(html).toContain("<dt>Consent</dt>");
+    expect(html).toContain("consent granted");
+    expect(html).toContain("<dt>Escalated</dt>");
+    expect(html).toContain("badge-escalated");
+  });
+
+  it("renders an em-dash placeholder before a consent decision exists", async () => {
+    await app.ready(); // default makeCallRow: consent null, escalated false
+    const res = await app.inject({
+      method: "GET",
+      url: "/admin/calls/1",
+      headers: { authorization: authHeader() },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toContain("badge-flag_none");
   });
 
   it("renders a 404 page for an unknown or non-numeric call", async () => {

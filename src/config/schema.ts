@@ -142,6 +142,64 @@ export const configSchema = z.object({
       password: optionalString(),
     })
     .default({}),
+
+  skills: z
+    .object({
+      /** Directory holding *.yaml skill manifests (loaded once at startup). */
+      dir: z.string().default("./skills"),
+      /** Upper bound on LLM tool-call round-trips per utterance. */
+      maxToolIterations: z.number().int().min(1).max(10).default(5),
+      /** Named HTTP endpoint templates; {param} substitution happens at dispatch. */
+      http: z
+        .record(
+          z.object({
+            url: z.string(),
+            method: z.string().default("POST"),
+            timeoutMs: z.number().int().default(10000),
+          }),
+        )
+        .default({}),
+      /** Named auth header credentials referenced by manifests (values are secrets). */
+      auth: z
+        .record(
+          z.object({
+            header: z.string(),
+            value: z.string().default(""),
+          }),
+        )
+        .default({}),
+    })
+    .default({}),
+
+  consent: z
+    .object({
+      /** Spoken consent notice before transcription; decline = never transcribed. */
+      enabled: z.boolean().default(true),
+      /** Notice language until the caller's reply vote picks the call language. */
+      initialLanguage: languageCode.default("et"),
+    })
+    .default({}),
+
+  escalation: z
+    .object({
+      /** Staff number for <Dial> transfer; empty = announce + end call instead. */
+      staffNumber: z.string().default(""),
+    })
+    .default({}),
+
+  retention: z
+    .object({
+      /** Purge transcripts/notes and anonymize caller numbers past the window. */
+      enabled: z.boolean().default(true),
+      /** Retention window in days for transcripts, notes, and caller numbers. */
+      days: z.number().int().min(1).default(90),
+      /**
+       * Secret salt for caller-number anonymization. Empty while enabled is
+       * allowed at the config level — the retention job guards it.
+       */
+      hashSalt: z.string().default(""),
+    })
+    .default({}),
 });
 
 export type AppConfig = z.infer<typeof configSchema>;

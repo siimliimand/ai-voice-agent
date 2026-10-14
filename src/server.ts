@@ -23,7 +23,7 @@ const DRAIN_TIMEOUT_MS = 10_000;
 const HARD_EXIT_MS = 15_000;
 
 export async function startServer(config: AppConfig = loadConfig()) {
-  const { app, db, sessions, transports } = await buildApp(config);
+  const { app, db, sessions, transports, retention } = await buildApp(config);
 
   await app.listen({ port: config.port, host: config.host });
   app.log.info(`ai-voice-agent listening on ${config.host}:${config.port}`);
@@ -49,6 +49,10 @@ export async function startServer(config: AppConfig = loadConfig()) {
     hardExit.unref();
 
     void (async () => {
+      // 0. Stop the retention scheduler so no purge run starts mid-shutdown
+      //    (an in-flight run finishes; bounded by the hard-exit timer).
+      retention?.stop();
+
       // 1. Stop accepting NEW connections without tearing down live
       //    websocket transports — app.close() would kill their sockets
       //    before clients ever see the "server_shutdown" hangup notice.

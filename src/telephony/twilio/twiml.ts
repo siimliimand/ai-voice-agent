@@ -40,3 +40,25 @@ export function buildTwiML(opts: TwiMLOptions): string {
     `</Response>`
   );
 }
+
+export interface TransferTwiMLOptions {
+  /** Spoken to the caller (via <Say>) before the call is bridged. */
+  announcementText: string;
+  /** Staff number the caller is bridged to (<Dial><Number>). */
+  staffNumber: string;
+}
+
+/**
+ * TwiML for the REST transfer (design D7, task 5.2): play the escalation
+ * announcement, then bridge the caller to the staff number. Sent as the
+ * `Twiml` form parameter of POST …/Calls/{CallSid}.json — deliberately
+ * without an XML declaration (a nested document must not carry one).
+ */
+export function buildTransferTwiML(opts: TransferTwiMLOptions): string {
+  return (
+    `<Response>` +
+    `<Say>${xmlEscape(opts.announcementText)}</Say>` +
+    `<Dial><Number>${xmlEscape(opts.staffNumber)}</Number></Dial>` +
+    `</Response>`
+  );
+}

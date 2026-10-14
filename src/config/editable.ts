@@ -7,9 +7,11 @@
  * only together with the frontend.
  *
  * Not editable (infra, never stored in the settings doc): port, host,
- * databaseUrl, publicBaseUrl. twilio.mediaWsPath and devBrowserCalls ARE
- * editable but flagged restartRequired (HTTP route registration / dev-page
- * wiring happens once at startup).
+ * databaseUrl, publicBaseUrl. skills.dir/http/auth are also file/env-only by
+ * design (manifest directory + endpoint/auth records; the directory is read
+ * once at startup). twilio.mediaWsPath and devBrowserCalls ARE editable but
+ * flagged restartRequired (HTTP route registration / dev-page wiring happens
+ * once at startup).
  */
 
 export type EditableFieldType = "string" | "number" | "boolean" | "select" | "secret";
@@ -175,6 +177,63 @@ export const EDITABLE_SECTIONS: EditableSection[] = [
         label: "Notes enabled",
         type: "boolean",
         help: "Structured post-call summaries; applies to calls ending after the change.",
+      },
+    ],
+  },
+  {
+    id: "consent",
+    title: "Consent notice",
+    fields: [
+      {
+        path: "consent.enabled",
+        label: "Consent notice enabled",
+        type: "boolean",
+        help: "Spoken consent notice before transcription; a declined caller is never transcribed.",
+      },
+      {
+        path: "consent.initialLanguage",
+        label: "Consent notice language",
+        type: "select",
+        options: ["et", "ru", "en"],
+        help: "Language of the notice; the caller's reply vote picks the call language.",
+      },
+    ],
+  },
+  {
+    id: "retention",
+    title: "GDPR retention",
+    fields: [
+      {
+        path: "retention.enabled",
+        label: "Retention enabled",
+        type: "boolean",
+        help: "Purges transcripts/notes and anonymizes caller numbers past the window; applies to the next run.",
+      },
+      {
+        path: "retention.days",
+        label: "Retention window (days)",
+        type: "number",
+        min: 1,
+        max: 3650,
+        help: "Call data older than this many days is purged by the daily retention run.",
+      },
+      {
+        path: "retention.hashSalt",
+        label: "Anonymization hash salt",
+        type: "secret",
+        help: "required before retention can anonymize; write-only",
+      },
+    ],
+  },
+  {
+    id: "escalation",
+    title: "Human escalation",
+    fields: [
+      {
+        path: "escalation.staffNumber",
+        label: "Staff number",
+        type: "string",
+        help: "staff number for <Dial> transfer; empty = announce + end call",
       },
     ],
   },

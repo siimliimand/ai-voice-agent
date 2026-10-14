@@ -1,6 +1,6 @@
 import { sql, type Kysely } from "kysely";
 import type { CallStatus, Language, Speaker } from "../types.js";
-import type { Database } from "./schema.js";
+import type { Consent, Database } from "./schema.js";
 
 /** Row shape of the calls table (ids/dates normalized to number/Date). */
 export interface CallRow {
@@ -14,6 +14,9 @@ export interface CallRow {
   startedAt: Date;
   endedAt: Date | null;
   durationS: number | null;
+  /** null until the consent flow records a decision. */
+  consent: Consent | null;
+  escalated: boolean;
 }
 
 /** Row shape of call_transcripts. */
@@ -117,6 +120,24 @@ export async function finalizeCall(
   await db.updateTable("calls").set(values).where("id", "=", callId).execute();
 }
 
+/** Record the caller's consent decision for a call. */
+export async function setCallConsent(
+  db: Kysely<Database>,
+  callId: number,
+  consent: Consent,
+): Promise<void> {
+  await db.updateTable("calls").set({ consent }).where("id", "=", callId).execute();
+}
+
+/** Mark whether a call was escalated to a human. */
+export async function setCallEscalated(
+  db: Kysely<Database>,
+  callId: number,
+  escalated: boolean,
+): Promise<void> {
+  await db.updateTable("calls").set({ escalated }).where("id", "=", callId).execute();
+}
+
 /** Append one transcript utterance for a call. */
 export async function insertUtterance(
   db: Kysely<Database>,
@@ -188,6 +209,8 @@ export async function listCalls(
       "c.started_at as started_at",
       "c.ended_at as ended_at",
       "c.duration_s as duration_s",
+      "c.consent",
+      "c.escalated",
       sql<string | null>`${eb.ref("n.note")} ->> 'summary'`.as("note_summary"),
       "n.model as note_model",
     ])
@@ -208,9 +231,30 @@ export async function listCalls(
     startedAt: new Date(r.started_at),
     endedAt: r.ended_at ? new Date(r.ended_at) : null,
     durationS: r.duration_s ?? null,
+    consent: r.consent ?? null,
+    escalated: r.escalated,
     noteSummary: r.note_summary,
     noteModel: r.note_model,
   }));
+}
+
+/** Per-status call counts (`SELECT status, count(*) … GROUP BY`). */
+export async function countCallsByStatus(
+  db: Kysely<Database>,
+): Promise<Record<CallStatus, number>> {
+  const rows = await db
+    .selectFrom("calls")
+    .select((eb) => ["status", eb.fn.countAll<number>().as("count")])
+    .groupBy("status")
+    .execute();
+  const counts: Record<CallStatus, number> = { in_progress: 0, completed: 0, failed: 0 };
+  for (const row of rows) {
+    const status = row.status;
+    if (status === "in_progress" || status === "completed" || status === "failed") {
+      counts[status] = Number(row.count); // pg returns int8 counts as strings
+    }
+  }
+  return counts;
 }
 
 /** Get a call by provider call SID, or null. */
@@ -274,6 +318,8 @@ function toCallRow(r: {
   started_at: Date;
   ended_at: Date | null | undefined;
   duration_s: number | null | undefined;
+  consent: Consent | null | undefined;
+  escalated: boolean;
 }): CallRow {
   return {
     id: Number(r.id),
@@ -286,5 +332,7 @@ function toCallRow(r: {
     startedAt: new Date(r.started_at),
     endedAt: r.ended_at ? new Date(r.ended_at) : null,
     durationS: r.duration_s ?? null,
+    consent: r.consent ?? null,
+    escalated: r.escalated,
   };
 }

@@ -1,5 +1,6 @@
 import pino from "pino";
 import type { Kysely } from "kysely";
+import { sql } from "kysely";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { deepMerge } from "../../src/config/index.js";
 import { EDITABLE_PATHS, EDITABLE_SECTIONS, isEditablePath } from "../../src/config/editable.js";
@@ -105,6 +106,26 @@ describe("editable contract", () => {
     expect(EDITABLE_PATHS.has("llm.overrides.en.conversation")).toBe(true);
     expect(EDITABLE_PATHS.has("twilio.mediaWsPath")).toBe(true);
     expect(EDITABLE_PATHS.has("devBrowserCalls")).toBe(true);
+    // M4: consent/retention/escalation are operator-editable...
+    for (const path of [
+      "consent.enabled",
+      "consent.initialLanguage",
+      "retention.enabled",
+      "retention.days",
+      "retention.hashSalt",
+      "escalation.staffNumber",
+    ]) {
+      expect(EDITABLE_PATHS.has(path), path).toBe(true);
+    }
+    // ...while the skills surface stays file/env-only by design.
+    for (const path of [
+      "skills.dir",
+      "skills.maxToolIterations",
+      "skills.http.booking.url",
+      "skills.auth.calendar.value",
+    ]) {
+      expect(EDITABLE_PATHS.has(path), path).toBe(false);
+    }
   });
 });
 
@@ -158,17 +179,31 @@ describe("EffectiveConfigResolver cache (stub db)", () => {
 });
 
 describe.skipIf(!databaseUrl)("resolveEffectiveConfig (postgres)", () => {
+  // Scratch database on the same server: this suite WRITES the settings doc
+  // for its whole run, and other DB-backed suites (settings API, consent
+  // flow) delete the shared `settings` row in parallel — a cross-file race
+  // that made the TTL test below flaky. An isolated database removes both
+  // directions.
+  let admin: Kysely<Database>;
   let db: Kysely<Database>;
+  const SCRATCH_DB = "voice_effective_config_test";
 
   beforeAll(async () => {
-    db = createDb(databaseUrl as string);
+    admin = createDb(databaseUrl as string);
+    await sql`DROP DATABASE IF EXISTS ${sql.raw(SCRATCH_DB)} WITH (FORCE)`.execute(admin);
+    await sql`CREATE DATABASE ${sql.raw(SCRATCH_DB)}`.execute(admin);
+    const scratchUrl = new URL(databaseUrl as string);
+    scratchUrl.pathname = `/${SCRATCH_DB}`;
+    db = createDb(scratchUrl.toString());
     await runMigrations(db);
-    await db.deleteFrom("settings").where("key", "=", "global").execute();
   });
 
   afterAll(async () => {
-    await db.deleteFrom("settings").where("key", "=", "global").execute();
-    await closeDb(db);
+    if (db) await closeDb(db);
+    if (admin) {
+      await sql`DROP DATABASE IF EXISTS ${sql.raw(SCRATCH_DB)} WITH (FORCE)`.execute(admin);
+      await closeDb(admin);
+    }
   });
 
   it("deep-merges the stored doc over the base config (base <- DB)", async () => {

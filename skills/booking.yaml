@@ -1,0 +1,34 @@
+# Shipped example skill: appointment booking over the HTTP calendar endpoint
+# configured at skills.http.booking (env: SKILLS_HTTP_BOOKING_URL / _METHOD /
+# _TIMEOUT_MS), authenticated with the skills.auth.calendar header credential
+# (env: SKILLS_AUTH_CALENDAR_HEADER / _VALUE). The dispatcher refuses to call
+# the endpoint until the caller has explicitly confirmed the booking, and every
+# invocation is audited as a skill_invocation call_events row.
+name: booking
+description: >
+  Book an appointment for the caller. Use when the caller wants to schedule
+  an appointment. Provide the appointment date in ISO format (YYYY-MM-DD),
+  the start time in 24-hour HH:MM format, the requested service, and the
+  patient's full name.
+parameters:
+  type: object
+  additionalProperties: false
+  properties:
+    date:
+      type: string
+      description: Appointment date in ISO format (YYYY-MM-DD), for example 2026-05-01.
+    time:
+      type: string
+      description: Appointment start time in 24-hour HH:MM format, for example 14:30.
+    service:
+      type: string
+      description: The service or treatment to book, for example "dental hygiene".
+    patient_name:
+      type: string
+      description: Full name of the patient the appointment is for.
+  required: [date, time, service, patient_name]
+execution: http
+endpoint: booking
+auth: calendar
+policies:
+  requires_confirmation: true

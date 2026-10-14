@@ -7,11 +7,12 @@ our own Node.js service wires together Twilio telephony, speech-to-text,
 an LLM brain, and text-to-speech — so prompts, data, latency, and future
 tool integrations stay fully under our control.
 
-> **Status:** implementation complete for the
-> [`add-voice-agent-mvp`](openspec/changes/add-voice-agent-mvp/) change
-> (M1–M3 scope; see [roadmap](#roadmap)). Typecheck + lint clean, **321 tests
-> in 39 suites green** (incl. DB-backed suites + a DB-backed e2e), production
-> Docker build verified.
+> **Status:** implementation complete through **M4** —
+> [`add-voice-agent-mvp`](openspec/changes/add-voice-agent-mvp/) (M1–M3) +
+> [`add-m4-skills-compliance`](openspec/changes/add-m4-skills-compliance/)
+> (see [roadmap](#roadmap)). Typecheck + lint clean, **515 tests in 59 suites
+> green** with `DATABASE_URL` (incl. DB-backed suites + DB-backed e2e; 0
+> skipped), production Docker build verified.
 >
 > **Operator-pending (needs real credentials/accounts):**
 > 1. **STT bake-off + provider/model selection** — needs real API keys and
@@ -19,9 +20,9 @@ tool integrations stay fully under our control.
 >    synthetic placeholders ([`test/fixtures/README.md`](test/fixtures/README.md)).
 > 2. **Real-call smoke test** over Twilio sandbox + ngrok (needs a Twilio
 >    account; [checklist](#real-call-smoke-checklist-operator-pending) below).
->
-> Consent announcement + retention automation are **M4** — required before
-> production launch (see [GDPR notes](#gdpr-notes)).
+> 3. **Set `RETENTION_HASH_SALT` before production** — the retention job
+>    refuses to purge or anonymize anything until a salt is configured
+>    (see [GDPR retention](#gdpr-retention)).
 
 ---
 
@@ -29,18 +30,26 @@ tool integrations stay fully under our control.
 
 1. A client calls the support line. Twilio answers and streams the call audio
    to this service over a WebSocket (Media Streams).
-2. The caller's language (et / ru / en) is detected from the first utterance;
+2. A spoken **consent notice** plays before anything is transcribed; only an
+   affirmative reply unlocks transcription (a decline ends the call with
+   nothing recorded).
+3. The caller's language (et / ru / en) is detected from the first utterance;
    STT, voice, and prompt lock to it (re-detected on switch).
-3. The agent converses naturally, handling interruptions (barge-in).
-4. Every finalized utterance is transcribed and persisted live (crash-safe).
-5. On hangup, an LLM turns the transcript into a **structured note**: summary,
+4. The agent converses naturally, handling interruptions (barge-in), can
+   **call tools** ("skills" — e.g. book an appointment, with spoken
+   confirmation before anything is executed), and can **hand over to a
+   human** (escalation).
+5. Every finalized utterance is transcribed and persisted live (crash-safe).
+6. On hangup, an LLM turns the transcript into a **structured note**: summary,
    caller intent, actions taken, unresolved issues, follow-ups, urgency.
-6. Staff review calls, transcripts, and notes in a small admin UI.
+7. Staff review calls, transcripts, and notes in a small admin UI; a
+   **retention job** purges aged transcripts/notes and anonymizes caller
+   numbers ([GDPR retention](#gdpr-retention)); `/api/metrics` exposes
+   latency/counters for scripts.
 
-**Not in this scope** (M4 follow-up change): skills/actions (appointment
-booking), human escalation, consent announcement, retention automation,
-outbound calling. See
-[Non-goals](openspec/changes/add-voice-agent-mvp/proposal.md).
+**Still out of scope:** outbound calling (see the
+[Non-goals](openspec/changes/add-voice-agent-mvp/proposal.md) and the M4
+[design non-goals](openspec/changes/add-m4-skills-compliance/design.md)).
 
 ---
 
@@ -82,6 +91,37 @@ feeding the same `VoicePipeline`; sessions are held in memory by
 `CallSessionManager` with incremental persistence to Postgres as the
 recovery point.
 
+**M4 additions** (skills + compliance change):
+
+- **Consent-gated call start** — with `consent.enabled`, a spoken notice
+  plays before any transcription exists: the pipeline starts without the
+  main STT stream and with the transcript tap locked; an ephemeral STT
+  window classifies only the caller's reply (and feeds the language vote).
+  An affirmative unlocks STT + transcription; a decline says goodbye and
+  hangs up with nothing ever persisted; an unclear reply re-asks once, then
+  fails closed. Without an LLM client the gate cannot classify replies, so
+  the call runs the ungated flow (logged). The decision lands in
+  `calls.consent` + `consent_granted`/`consent_declined` events.
+- **Tool-calling loop + confirmation** — when skills are loaded, the
+  conversation manager streams with tool definitions, dispatches the model's
+  tool calls (arguments JSON-Schema-validated via ajv), appends tool
+  results, and continues up to `skills.maxToolIterations`; every processed
+  invocation is audited to `call_events` (`skill_invocation`). Skills with
+  `requires_confirmation` refuse to execute until the caller explicitly
+  confirms in the next turn; barge-in cancels pending dispatches.
+- **Human escalation** — the built-in `escalate_to_human` tool sets
+  `calls.escalated` + an `escalation_triggered` event and forces the stored
+  note's urgency to high. On Twilio it first attempts a REST call update
+  that `<Say>`s the announcement and `<Dial>`s the staff number
+  (`ESCALATION_STAFF_NUMBER`); any REST failure falls back to announce +
+  end the call (still escalated + audited).
+- **GDPR retention** — an in-process job purges aged transcripts/notes and
+  anonymizes caller numbers at startup and every 24 h
+  (see [GDPR retention](#gdpr-retention)).
+- **Metrics** — an in-process registry (bounded per-stage latency rings,
+  call-status counters, error counters, active-session gauge) exposed as
+  JSON at `GET /api/metrics` (see below).
+
 ### Key design decisions
 
 | Area | Choice | Why |
@@ -112,15 +152,17 @@ src/
 ├── stt/             # SttProvider interface + scribe / soniox / gladia adapters
 ├── tts/             # TtsProvider interface, sentence chunker, ElevenLabs adapter
 ├── llm/             # OpenRouter streaming client + model-per-role resolution
-├── agent/           # conversation manager, language detect/lock, prompts (et/ru/en), voice registry
-├── pipeline/        # VoicePipeline: audio → STT → agent → TTS → transport, barge-in, latency marks
+├── agent/           # conversation manager, language detect/lock, prompts (et/ru/en), voice registry, tool loop + confirmation, escalation
+├── skills/          # YAML manifests → tool definitions, dispatcher (ajv validation, confirmation policy, audit), http/db executors
+├── pipeline/        # VoicePipeline: audio → STT → agent → TTS → transport, barge-in, latency marks, consent gate
 ├── notes/           # incremental transcript writer (live) + post-call summarizer → structured note
+├── retention/       # GDPR retention job: batched purge + caller-number anonymization, 24 h scheduler
 ├── session/         # CallSession + CallSessionManager (active-call registry)
 ├── db/              # Kysely client, migrations, typed queries, migrate-cli
-├── api/             # admin JSON API (/api/calls…)
+├── api/             # admin JSON API (/api/calls…, /api/metrics, /api/settings)
 ├── auth/            # basic auth (constant-time compare, fail-closed)
 ├── web/             # admin pages (server-rendered), dev-call routes, static dir
-└── observability/   # per-turn latency tracking (STT finalize / LLM first token / TTS first byte / e2e)
+└── observability/   # metrics registry (latency rings p50/p95, counters, gauge) + per-turn latency tracking
 ```
 
 Supporting: `migrations/` (SQL), `scripts/` (`bakeoff/`, `conformance/`,
@@ -150,10 +192,58 @@ even against well-formed credentials).
 | `GET /admin/calls/:id` | basic auth | Call detail: metadata, full transcript, structured note (404 page for unknown ids) |
 | `GET /api/calls?limit=&offset=` | basic auth | Paginated call list JSON (default 50, max 200) |
 | `GET /api/calls/:id` | basic auth | `{call, transcript, note}` JSON (`400` bad id, `404` unknown) |
+| `GET /api/metrics` | basic auth | JSON metrics (D10): process snapshot (latency p50/p95 per stage, counters, `activeSessions`, boot `since`) + DB-backed `callsByStatusDb`. `503 {error}` if the registry is not wired (should not happen) — shape below |
 | `GET /api/settings` | basic auth | Runtime settings: `{values, overrides, sections}` — effective config, dotted paths with a DB override, editable-field contract. Secret fields masked as `{set, hint:"…last4"}`. Needs `DATABASE_URL` |
 | `PUT /api/settings` | basic auth | Save `{values, reset[]}`: infra paths (`port`/`host`/`databaseUrl`/`publicBaseUrl`) rejected `400`; merged candidate re-validated with the zod schema → `400` + issue list; blank secret = keep current; `reset[]` drops per-field overrides |
 | `GET /admin/settings` | basic auth | Server-rendered settings form (grouped sections, override badges, per-field reset, read-only infra display); save POSTs and redirects back with `?saved=1` |
 | `GET /static/*` | public | Static assets from `public/` |
+
+### Metrics (`GET /api/metrics`)
+
+Same basic-auth gate as the other `/api` routes. One JSON document per
+request, design D10 — no Prometheus exposition, made for scripts:
+
+```json
+{
+  "since": "2026-10-13T10:00:00.000Z",
+  "latency": {
+    "stt_finalize":    { "count": 120, "p50": 210, "p95": 340 },
+    "llm_first_token": { "count": 120, "p50": 480, "p95": 900 },
+    "tts_first_byte":  { "count": 120, "p50": 150, "p95": 260 },
+    "end_to_end":      { "count": 120, "p50": 980, "p95": 1600 }
+  },
+  "callsByStatus":   { "in_progress": 42, "completed": 40, "failed": 2 },
+  "callsByStatusDb": { "in_progress": 1,  "completed": 1180, "failed": 39 },
+  "activeSessions": 1,
+  "errors":  { "pipeline": 0, "llm": 1, "stream": 0, "skill": 2 },
+  "counters": { "skills_invoked": 17, "skills_refused": 3 },
+  "process": { "since": "2026-10-13T10:00:00.000Z" }
+}
+```
+
+Two layers, two semantics:
+
+- **Process layer** (`since`, `latency`, `callsByStatus`, `errors`,
+  `counters`, `activeSessions`) — lives in memory only and **resets on
+  restart**. `since` is the registry boot timestamp and makes every scrape's
+  reset window explicit (`process.since` echoes it for scrapers that read one
+  key). `latency` holds per-stage nearest-rank p50/p95 over a bounded 500
+  -sample ring (`p50`/`p95` are `null` until a stage has samples). In
+  `callsByStatus`, `in_progress` is a *started-calls counter* — it is never
+  decremented when a call ends; live-ness is `activeSessions`.
+- **DB layer** (`callsByStatusDb`) — `SELECT status, count(*) … GROUP BY`
+  over the persisted `calls` table; survives restarts and is authoritative
+  for final status counts. Its `in_progress` counts call rows still open in
+  the database. Kept under a separate key so it can't be confused with the
+  process counters; needs `DATABASE_URL`.
+
+| Process key | Meaning |
+|---|---|
+| `latency.<stage>` | `{count, p50, p95}` ms per turn stage (ring of 500) |
+| `callsByStatus` | calls **started** since boot by status (finals accumulate) |
+| `errors` | pipeline / llm / stream / skill error counters since boot |
+| `counters` | generic named counters (e.g. skills framework), starts empty |
+| `activeSessions` | live gauge of non-finalized sessions |
 
 ---
 
@@ -216,13 +306,29 @@ present) and uses the same field names as the zod schema in
 | **Admin** | | |
 | `ADMIN_USER` | `admin` | Basic-auth username |
 | `ADMIN_PASSWORD` | — | Basic-auth password; unset ⇒ admin locked (fail-closed `401`) |
+| **Skills (tool calling)** | | |
+| `SKILLS_DIR` | `./skills` | Directory of `*.yaml` skill manifests (read once at startup; see [Skills](#skills-tool-calling)) |
+| `SKILLS_MAX_TOOL_ITERATIONS` | `5` | Max LLM tool-call round-trips per utterance (1–10) |
+| `SKILLS_HTTP_BOOKING_URL` | — | `booking` endpoint URL; unset ⇒ the skill answers with a clear "not configured" tool result |
+| `SKILLS_HTTP_BOOKING_METHOD` | `POST` | `booking` endpoint HTTP method |
+| `SKILLS_HTTP_BOOKING_TIMEOUT_MS` | `10000` | `booking` endpoint request timeout (ms) |
+| `SKILLS_AUTH_CALENDAR_HEADER` / `_VALUE` | — | Auth header name + secret sent with `booking` requests (the value is a secret) |
+| **Consent notice** | | |
+| `CONSENT_ENABLED` | `true` | Spoken consent notice before transcription; a decline ends the call untranscribed (live-editable via `/admin/settings`) |
+| `CONSENT_INITIAL_LANGUAGE` | `et` | Notice language until the caller's reply vote: `et` \| `ru` \| `en` (live-editable) |
+| **Escalation** | | |
+| `ESCALATION_STAFF_NUMBER` | — | Staff number for the escalation `<Dial>` transfer; empty ⇒ announce + end call instead (live-editable) |
+| **GDPR retention** | | |
+| `RETENTION_ENABLED` | `true` | Retention job on/off (live-editable) |
+| `RETENTION_DAYS` | `90` | Transcripts/notes older than this are purged and caller numbers anonymized (live-editable) |
+| `RETENTION_HASH_SALT` | — | Secret salt for caller-number anonymization; **set before production** — while empty (and retention enabled) every run is skipped with an error. Write-only, live-editable (see [GDPR retention](#gdpr-retention)) |
 
 ### Runtime settings (admin UI)
 
 The editable surface (STT/TTS providers and models, voices, provider and LLM
-keys, LLM model ids, VAD, notes, Twilio credentials, admin credentials, and
-the dev-call options) can also be overridden at runtime from
-`/admin/settings`, making the layering four deep:
+keys, LLM model ids, VAD, notes, consent, escalation, retention, Twilio
+credentials, admin credentials, and the dev-call options) can also be
+overridden at runtime from `/admin/settings`, making the layering four deep:
 **schema defaults ← `config.json` ← environment ← DB settings overrides**
 (later wins; deep merged). Overrides are stored as one nested JSON document
 in the `settings` table (`key='global'`), deep-merged over the startup config
@@ -257,9 +363,80 @@ missing pieces become noop providers with a single pipeline code path
 | `ELEVENLABS_API_KEY` (STT = scribe) | Calls run **without transcription** |
 | `ELEVENLABS_API_KEY` (TTS = elevenlabs) | Calls run **without speech** |
 | `OPENROUTER_API_KEY` | Calls run **without greeting or replies**; each session announces `llm_not_configured` |
-| `DATABASE_URL` | **No persistence, no notes**; `/api/*` not registered, `/admin` renders a "disabled" page |
+| `DATABASE_URL` | **No persistence, no notes**; skills disabled, no retention job, no metrics DB layer; `/api/*` not registered, `/admin` renders a "disabled" page |
+| Skills + no `DATABASE_URL` | Skills stay **disabled** (every invocation is audited to the db); calls run the tool-free conversation path (warn logged at boot) |
+| `RETENTION_HASH_SALT` empty (retention enabled) | Retention job **skips every run** with an error log — no purge, no anonymization — until a salt is set (fail-safe) |
+| `ESCALATION_STAFF_NUMBER` empty | Escalation **announces and ends the call** instead of a `<Dial>` transfer (no REST attempt); the escalated flag + events are still recorded — same fallback as a failed Twilio REST transfer |
+| Metrics registry not wired | `GET /api/metrics` answers `503 {error}` (the composed app always wires the registry, so this only guards direct route reuse) |
 | `TWILIO_AUTH_TOKEN` | `/twiml` answers `503` to every request (fail-closed) |
 | `ADMIN_PASSWORD` | `/admin` + `/api/*` answer `401` even to well-formed credentials (fail-closed) |
+
+---
+
+## Skills (tool calling)
+
+The conversation agent can call tools ("skills") mid-call. A skill is one
+declarative YAML manifest describing a callable tool; manifests are loaded
+**once at startup** from `SKILLS_DIR` (default `./skills`) — restart the
+service to pick up changes. Invalid manifests are skipped with a logged
+error (the service still boots). Tool calling needs a **tool-capable
+conversation model** (`LLM_CONVERSATION_MODEL`; `npm run conformance`
+reports whether a model emits tool calls).
+
+### Manifest format (`<skills.dir>/*.yaml`)
+
+| Field | Required | Description |
+|---|---|---|
+| `name` | yes | Lowercase tool id, `^[a-z][a-z0-9_-]{1,63}$` — shown verbatim to the LLM |
+| `description` | yes | LLM-facing: what the tool does and when to call it |
+| `parameters` | yes | JSON Schema for the arguments object; validated with ajv at dispatch, invalid calls become error tool-results |
+| `execution` | yes | `http` \| `db` \| `rag` |
+| `endpoint` | for `http` | Name of the endpoint template in config `skills.http.<name>` |
+| `sql` | for `db` | A single read-only `SELECT`/`WITH` statement; `{param}` slots bind as query parameters (writes rejected at load) |
+| `auth` | no | Reference to a header credential in config `skills.auth.<ref>` |
+| `policies.requires_confirmation` | no | `true` ⇒ dispatch refuses until the caller explicitly confirms (see below) |
+
+Execution types: **http** calls the configured endpoint template
+(`{param}` slots are URI-encoded into the URL, the validated arguments go
+out as the JSON body); **db** runs the manifest SQL against Postgres;
+**rag** is a stub that returns a clear not-implemented tool result.
+
+Secrets never live in manifests — the `auth` field only names a credential
+configured via env or the JSON config file.
+
+### Shipped `booking` skill
+
+`skills/booking.yaml` books an appointment (date, time, service, patient
+name) over the `booking` HTTP endpoint and requires confirmation before
+dispatch. Its config keys:
+
+| Key | Default | Description |
+|---|---|---|
+| `SKILLS_HTTP_BOOKING_URL` | — | Booking endpoint URL; unset ⇒ booking answers with a clear "not configured" tool result |
+| `SKILLS_HTTP_BOOKING_METHOD` | `POST` | HTTP method for the booking request |
+| `SKILLS_HTTP_BOOKING_TIMEOUT_MS` | `10000` | Booking request timeout (ms) |
+| `SKILLS_AUTH_CALENDAR_HEADER` / `_VALUE` | — | Auth header name + secret sent with every booking request |
+
+Additional endpoints/auth refs have no generic env naming — define them in
+the JSON config file under `skills.http.<name>` / `skills.auth.<ref>`. The
+whole `skills.*` config section is intentionally **not** editable from the
+admin settings UI: it is file/env-only and read at startup.
+
+### Confirmation flow (operator view)
+
+1. The model calls `booking`; the dispatcher sees
+   `requires_confirmation: true`, refuses, and the agent asks the caller to
+   confirm. Audited as `confirmation_required` — the calendar endpoint is
+   not touched.
+2. On the caller's affirmative reply the dispatch re-runs with the
+   confirmation flag; only then is the HTTP request sent. Audited as
+   `executed`.
+3. Every invocation — success, validation error, refusal, execution error —
+   writes a `skill_invocation` row to `call_events` with the skill name,
+   arguments, and outcome (arguments are tool arguments, never secrets).
+
+A reusable mock calendar server for tests lives at
+`test/fixtures/mock-calendar.ts`.
 
 ---
 
@@ -328,16 +505,17 @@ emits tool calls. Exits 1 if any model fails to stream; skips cleanly without
 
 ### Testing
 
-Current state: **321 tests green across 39 suites** (unit, language, and e2e)
-with `DATABASE_URL` set; without it, 18 tests in 4 DB-backed suites skip
-cleanly.
+Current state: **515 tests green across 59 suites, 0 skipped** (unit,
+language, and e2e) with `DATABASE_URL` set; without it, 48 tests in 8
+DB-backed suites skip cleanly (exit still 0).
 
 | Level | What | Command | Notes |
 |---|---|---|---|
-| Unit | Audio codecs vs golden fixtures, STT/TTS/LLM adapters, agent, notes, Twilio routes/WS, admin API/DB queries | `npm test` | hermetic, no network |
+| Unit | Audio codecs vs golden fixtures, STT/TTS/LLM adapters, agent (incl. tool loop, confirmation, prompts), notes, Twilio routes/WS, admin API/DB queries | `npm test` | hermetic, no network |
 | Runtime settings | Effective-config merge precedence + fail-safe fallback, secret masking, `400` validation (incl. infra-path rejection), per-field reset, dynamic basic-auth (live-apply + fail-closed), settings-doc read/merge/unset | `npm test` | `test/config/effective`, `test/api/settings`, `test/api/settings-page`, `test/auth/basic-auth-dynamic`, `test/db/settings`; Postgres-backed parts skip without `DATABASE_URL` |
+| M4 suites | Skills (loader, dispatcher, http/db executors, shipped `booking` skill), consent gate + call-start flow, escalation (builtin + Twilio REST transfer + fallback), retention job + settings **live-apply**, metrics registry (percentile/counter math, ring bounding, pipeline feeds) + `/api/metrics` | `npm test` | `test/skills`, `test/app`, `test/pipeline`, `test/agent`, `test/retention`, `test/observability`, `test/api/metrics`; Postgres-backed parts skip without `DATABASE_URL` |
 | Language | Detection et/ru/en + et↔ru code-switching fixtures | `npm test` | part of the suite |
-| E2E | Fixture wav through the real browser transport → transcript + structured note asserted in Postgres | `npm run test:e2e` | needs Postgres; **skips cleanly without `DATABASE_URL`** |
+| E2E | Fixture calls through the real browser transport: booking with spoken confirmation against the mock calendar, consent grant/decline, browser-path escalation — transcripts, structured notes, `skill_invocation`/consent/escalation audit rows asserted in Postgres | `npm run test:e2e` | needs Postgres; **skips cleanly without `DATABASE_URL`** |
 | STT bake-off | WER + latency per provider × fixture | `npm run bakeoff` | keys + real recordings; JSON report to `reports/` |
 | LLM conformance | Streaming + tool-call readiness per configured model | `npm run conformance` | exit 1 on stream failure |
 | Latency budget | Per-turn `stt_finalize` / `llm_first_token` / `tts_first_byte` / end-to-end timings | read logs | target end-to-end < 1 s (`TURN_LATENCY_TARGET_MS`) |
@@ -373,10 +551,13 @@ npm run test:e2e
 ### Real-call smoke checklist (operator-pending)
 
 - [ ] Caller hears the greeting; language locks after the first utterance (try et / ru / en)
+- [ ] Consent notice is audible **before** any transcription starts; a decline ends the call untranscribed
+- [ ] Booking request triggers the spoken confirmation; only the affirmative reply books against the calendar endpoint
+- [ ] Asking for a human escalates: Twilio `<Dial>` transfers to `ESCALATION_STAFF_NUMBER` (or the announce + end fallback fires)
 - [ ] Replies are audible and per-turn latency lands near the < 1 s budget (check per-stage log lines)
 - [ ] Barge-in: speaking over the agent stops playback promptly mid-sentence
 - [ ] Transcript rows appear in Postgres **during** the call (crash-safe persistence)
-- [ ] After hangup: `calls` row finalized (status / duration / language) and a structured note is generated; both visible in `/admin`
+- [ ] After hangup: `calls` row finalized (status / duration / language / consent / escalated) and a structured note is generated; both visible in `/admin`
 
 ---
 
@@ -407,14 +588,42 @@ Runtime settings live in the `settings` Postgres table (migration
 survive container restarts — no extra state to snapshot. Precedence is
 unchanged on boot: the environment still wins for infra values, while DB
 overrides win for the editable surface (models, voices, VAD, provider keys,
-admin credentials).
+admin credentials, consent/escalation/retention).
 
 ### GDPR notes
 
 - Only **transcripts** are stored, never raw call audio.
 - Transcripts are personal data: host in the EU, restrict admin access
-  (basic auth in v1), and complete the M4 items **before production
-  launch** — consent announcement flow and GDPR retention automation.
+  (basic auth in v1), and complete the pre-production items — set the
+  retention salt (below) and run the real-call smoke checklist.
+
+### GDPR retention
+
+The retention job (`src/retention/job.ts`) runs in-process at startup and
+then every 24 h (single-instance by design; overlapping runs are guarded;
+re-runs are idempotent — a call anonymized once is never selected again).
+Each run processes, in transactional batches of 1000, every call started
+before `now − retention.days` that is not yet anonymized:
+
+- **Deleted:** the call's `call_transcripts` and `call_notes` rows.
+- **Kept:** the `calls` row (the call-history record), with `from_number`
+  replaced by `anon:<12 hex chars of sha256(number + hashSalt)>` — the
+  per-deployment secret salt is what prevents reconstructing caller numbers
+  from a candidate list once hashed.
+- **Audit trail:** one small `retention_purged` row in `call_events` per
+  purged call (`{retentionDays, purgedAt}`), plus a summary log line per run.
+
+Fail-safe: with retention **enabled** and an **empty**
+`retention.hashSalt`, every run is skipped with an error log — nothing is
+ever deleted or anonymized without the salt.
+**Set the salt before production** (`RETENTION_HASH_SALT` env, or the
+settings console below).
+
+`retention.enabled` / `retention.days` / `retention.hashSalt` are editable
+live via `PUT /api/settings` or `/admin/settings`: the job re-reads the
+effective config on every run, so changes apply on the next run without a
+restart (covered by a dedicated live-apply test). The salt is write-only —
+`GET` returns `{set, hint:"…last4"}`, never the value.
 
 ---
 
@@ -442,4 +651,4 @@ openspec validate add-voice-agent-mvp
 | M1 | Pipeline skeleton, browser dev harness, STT bake-off script, Twilio transport | **implemented** (bake-off run pending real keys + real recordings) |
 | M2 | Trilingual detection/locking, per-language prompts + voices, barge-in | **implemented** |
 | M3 | Notes pipeline (live transcripts, post-call summaries), admin UI | **implemented** |
-| M4 | Skills framework + actions (booking), human escalation, consent announcement, retention automation, latency dashboards, outbound calling | future change — consent + retention are pre-production requirements |
+| M4 | Skills framework + actions (booking), human escalation, consent announcement, retention automation, latency dashboards | **implemented** (real-call Twilio smoke pending; outbound calling is a recorded [non-goal](openspec/changes/add-m4-skills-compliance/design.md)) |

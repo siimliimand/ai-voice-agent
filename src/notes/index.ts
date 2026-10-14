@@ -62,6 +62,16 @@ export function sessionCallId(session: CallSession): number | undefined {
 }
 
 /**
+ * Read the escalation flag recorded on a session (session.meta.escalated,
+ * set by the escalation handler, design D7). One of the two escalation
+ * sources for the note's forced urgency — the persisted calls.escalated row
+ * is checked in the summarizer regardless.
+ */
+export function sessionEscalated(session: CallSession): boolean {
+  return session.meta["escalated"] === true;
+}
+
+/**
  * Subscribe to session-manager "ended" events and generate structured notes.
  * Returns an unsubscribe function.
  */
@@ -101,7 +111,14 @@ export function attachNotesPipeline(options: AttachNotesPipelineOptions): () => 
     }
 
     try {
-      await summarizeCall({ db, llm, config: summarizeConfig, callId, logger: log });
+      await summarizeCall({
+        db,
+        llm,
+        config: summarizeConfig,
+        callId,
+        escalated: sessionEscalated(session),
+        logger: log,
+      });
     } catch (err) {
       log.error({ err, callId, callSid: session.callSid }, "notes pipeline: summarizeCall failed");
     }

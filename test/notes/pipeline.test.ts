@@ -7,13 +7,15 @@ import type { Logger } from "../../src/logging.js";
 import { CallSession } from "../../src/session/call-session.js";
 import { CallSessionManager } from "../../src/session/manager.js";
 import { attachNotesPipeline } from "../../src/notes/index.js";
-import { getTranscript, insertCallEvent, upsertNote } from "../../src/db/queries.js";
+import { getCallById, getTranscript, insertCallEvent, upsertNote } from "../../src/db/queries.js";
+import type { CallRow, TranscriptRow } from "../../src/db/queries.js";
 
 vi.mock("../../src/db/queries.js", async () => {
   const actual = await vi.importActual<Record<string, unknown>>("../../src/db/queries.js");
   return {
     ...actual,
-    getTranscript: vi.fn(async () => [
+    getCallById: vi.fn(async () => null as CallRow | null),
+    getTranscript: vi.fn(async (): Promise<TranscriptRow[]> => [
       { id: 1, callId: 11, speaker: "caller", text: "Tere", language: "et", atMs: 0 },
     ]),
     upsertNote: vi.fn(async () => undefined),
@@ -21,6 +23,7 @@ vi.mock("../../src/db/queries.js", async () => {
   };
 });
 
+const getCallByIdMock = vi.mocked(getCallById);
 const getTranscriptMock = vi.mocked(getTranscript);
 const upsertNoteMock = vi.mocked(upsertNote);
 const insertCallEventMock = vi.mocked(insertCallEvent);
@@ -68,6 +71,7 @@ const endedSession = (
 
 beforeEach(() => {
   chat.mockClear().mockResolvedValue(validNoteJson);
+  getCallByIdMock.mockClear().mockResolvedValue(null);
   getTranscriptMock.mockClear();
   upsertNoteMock.mockClear().mockResolvedValue(undefined);
   insertCallEventMock.mockClear().mockResolvedValue(1);
@@ -133,5 +137,22 @@ describe("attachNotesPipeline", () => {
       });
     });
     expect(silentLogger.error).toHaveBeenCalled();
+  });
+
+  it("forces the stored note urgent when the session was escalated (task 5.1)", async () => {
+    const { sessions, session } = endedSession(11);
+    session.meta["escalated"] = true; // set by the escalation handler (design D7)
+    attachNotesPipeline({ db: fakeDb, sessions, config: config(true), llm: { chat }, logger });
+
+    sessions.end(session, "completed");
+
+    await vi.waitFor(() => expect(upsertNoteMock).toHaveBeenCalled());
+    const stored = upsertNoteMock.mock.calls[0]?.[1]?.note as {
+      urgency: string;
+      actions_taken: string[];
+    };
+    // The model said "normal"; the escalation forces high + the action.
+    expect(stored.urgency).toBe("high");
+    expect(stored.actions_taken).toContain("escalated the call to a human agent");
   });
 });

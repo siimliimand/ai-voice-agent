@@ -82,7 +82,11 @@ const post = async (body: string): Promise<{ status: number; body: string; locat
     headers: { authorization: authHeader(), "content-type": "application/x-www-form-urlencoded" },
     payload: body,
   });
-  return { status: res.statusCode, body: res.body, location: res.headers["location"] as string | undefined };
+  return {
+    status: res.statusCode,
+    body: res.body,
+    location: res.headers["location"] as string | undefined,
+  };
 };
 
 describe("basic auth", () => {
@@ -135,6 +139,20 @@ describe("GET /admin/settings (rendering)", () => {
     expect(body).toContain('name="twilio.authToken" type="password" placeholder="unchanged"');
   });
 
+  it("renders the M4 consent/retention/escalation fields with hashSalt as a password input", async () => {
+    await app.ready();
+    const { body } = await get();
+    expect(body).toContain('name="consent.enabled" type="checkbox" value="true" checked');
+    expect(body).toContain('name="consent.initialLanguage"');
+    expect(body).toContain('<option value="et" selected>');
+    expect(body).toContain('name="retention.enabled" type="checkbox" value="true" checked');
+    expect(body).toContain('name="retention.days" type="number" min="1" max="3650" value="90"');
+    expect(body).toContain('name="retention.hashSalt" type="password" placeholder="unchanged"');
+    expect(body).toContain("required before retention can anonymize");
+    expect(body).toContain('name="escalation.staffNumber" type="text"');
+    expect(body).toContain("empty = announce + end call");
+  });
+
   it("masks secrets: never renders a raw value, shows set/hint state", async () => {
     await app.ready();
     const { body } = await get();
@@ -164,7 +182,7 @@ describe("GET /admin/settings (rendering)", () => {
   });
 
   it("escapes stored override values (XSS)", async () => {
-    db.saveSettingsDoc({ llm: { models: { conversation: '<script>alert(1)</script>' } } });
+    db.saveSettingsDoc({ llm: { models: { conversation: "<script>alert(1)</script>" } } });
     await app.ready();
     const { body } = await get();
     expect(body).toContain("&lt;script&gt;alert(1)&lt;/script&gt;");
@@ -231,6 +249,16 @@ describe("POST /admin/settings (valid)", () => {
     const on = await post("notes.enabled=true");
     expect(on.status).toBe(303);
     expect(db.doc()).toMatchObject({ notes: { enabled: true } });
+  });
+
+  it("persists the new M4 fields through the same validation path", async () => {
+    await app.ready();
+    const res = await post("retention.days=45&escalation.staffNumber=%2B372555111");
+    expect(res.status).toBe(303);
+    expect(db.doc()).toMatchObject({
+      retention: { days: 45 },
+      escalation: { staffNumber: "+372555111" },
+    });
   });
 
   it("drops empty secrets (keep current) and stores a filled secret without echoing it", async () => {
@@ -319,7 +347,10 @@ describe("POST /admin/settings (urlencoded parser coexistence)", () => {
     registerBasicAuth(host, makeConfig());
     registerSettingsPage(host, { db, config: makeConfig() });
     await host.ready();
-    db.saveSettingsDoc({ llm: { models: { conversation: "test/override-model" } }, notes: { enabled: false } });
+    db.saveSettingsDoc({
+      llm: { models: { conversation: "test/override-model" } },
+      notes: { enabled: false },
+    });
     db.saveSettingsDoc.mockClear();
     const res = await host.inject({
       method: "POST",
@@ -363,7 +394,7 @@ const STUB_STATE: SettingsPageState = {
   sections: STUB_SECTIONS,
   values: {
     demo: {
-      text: 'hello & <world>',
+      text: "hello & <world>",
       count: 5,
       flag: true,
       kind: "beta",

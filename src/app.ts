@@ -21,30 +21,51 @@ import type { WebSocket } from "ws";
 import { registerAdminApi } from "./api/routes.js";
 import { registerSettingsApi, kyselySettingsDb } from "./api/settings.js";
 import { kyselyAdminDb } from "./api/db.js";
+import { AffirmationClassifier } from "./agent/affirmation.js";
 import { basicAuthScope, registerBasicAuth } from "./auth/basic-auth.js";
-import { ConversationManager } from "./agent/conversation-manager.js";
+import { ConversationManager, type SkillLoopDeps } from "./agent/conversation-manager.js";
+import { createEscalationHandler } from "./agent/escalation.js";
+import { callEventAuditor } from "./agent/call-event-audit.js";
 import { LanguageManager } from "./agent/language-manager.js";
+import {
+  getConsentGoodbye,
+  getConsentNotice,
+  getConsentReask,
+} from "./agent/prompts/index.js";
 import { voiceForLanguage } from "./agent/voice-registry.js";
 import { EffectiveConfigResolver } from "./config/effective.js";
 import { loadConfig } from "./config/index.js";
 import type { AppConfig } from "./config/schema.js";
 import { closeDb, createDb } from "./db/client.js";
 import { runMigrations } from "./db/migrate.js";
-import type { Database } from "./db/schema.js";
-import { finalizeCall, insertCall, insertCallEvent } from "./db/queries.js";
+import type { Consent, Database } from "./db/schema.js";
+import { finalizeCall, insertCall, insertCallEvent, setCallConsent } from "./db/queries.js";
 import { OpenRouterClient } from "./llm/openrouter.js";
 import { logger } from "./logging.js";
 import { attachNotesPipeline, TranscriptWriter } from "./notes/index.js";
+import { attachSessionMetrics, MetricsRegistry } from "./observability/metrics.js";
 import {
   VoicePipeline,
+  type ConsentDecision,
+  type ConsentGateOptions,
+  type ConsentReply,
+  type ConsentUtterance,
   type ConversationAgent,
   type PipelineUtterance,
 } from "./pipeline/voice-pipeline.js";
+import { RetentionJob } from "./retention/index.js";
+import {
+  createDbExecutor,
+  createDispatcher,
+  createHttpExecutor,
+  loadSkills,
+} from "./skills/index.js";
 import { createSttProvider, type SttProvider } from "./stt/index.js";
 import type { CallTransport } from "./telephony/transport.js";
 import type { BrowserTransport } from "./telephony/browser-transport.js";
 import { attachTwilioMediaStream } from "./telephony/twilio/media-stream.js";
 import { registerTwilioRoutes } from "./telephony/twilio/routes.js";
+import { createTwilioTransfer } from "./telephony/twilio/transfer.js";
 import { createTtsProvider, type TtsProvider } from "./tts/index.js";
 import type { Language } from "./types.js";
 import { registerDevCallRoutes } from "./web/dev-call/routes.js";
@@ -79,8 +100,12 @@ export interface AppHandle {
     llm: OpenRouterClient | undefined;
   };
   sessions: CallSessionManager;
+  /** Process-local metrics registry (stage latencies, counters, gauge). */
+  metrics: MetricsRegistry;
   /** Live transports by callSid — used by graceful shutdown to drain calls. */
   transports: Map<string, CallTransport>;
+  /** GDPR retention scheduler (undefined when running degraded, no db). */
+  retention: RetentionJob | undefined;
   /** Wire one transport into a full call session. Never throws. */
   startCallSession: (transport: CallTransport) => () => void;
   /** Close the Fastify app, then the database when this app created it. */
@@ -100,6 +125,18 @@ const ADMIN_DISABLED_HTML = `<!doctype html>
 </main>
 </body>
 </html>`;
+
+/** Transport-independent hangup reason recorded for a declined consent (D5). */
+export const CONSENT_DECLINED_HANGUP_REASON = "consent_declined";
+
+/**
+ * Session-meta flag marking a call whose caller declined consent. On a
+ * declined call nothing is ever transcribed, so (unlike `escalated`) no note
+ * input ever depends on it — the persisted calls.consent column is the
+ * external source of truth; the flag exists so in-process consumers can ask
+ * without a database.
+ */
+export const SESSION_CONSENT_DECLINED_KEY = "consent_declined";
 
 export async function buildApp(
   config: AppConfig = loadConfig(),
@@ -179,9 +216,37 @@ export async function buildApp(
   // cache hit; without a database it simply returns the base config.
   const resolver = new EffectiveConfigResolver(config, db);
 
+  // Skills framework (design D1–D4): manifests load ONCE at startup from
+  // config.skills.dir (restart-required by design, like the manifests they
+  // describe). The dispatcher audits invocations through the database, so
+  // without persistence skills stay disabled and calls run the tool-free
+  // conversation path — same degradation-matrix posture as notes/retention.
+  const skillRegistry = loadSkills(config, { logger: appLog });
+  const skillDispatcher = db
+    ? createDispatcher({
+        registry: skillRegistry,
+        executors: {
+          http: createHttpExecutor({ config }),
+          db: createDbExecutor({ db }),
+        },
+        db,
+        logger: appLog,
+      })
+    : undefined;
+  if (skillDispatcher === undefined && skillRegistry.size > 0) {
+    appLog.warn("skills disabled: invocation audit needs DATABASE_URL");
+  }
+
   // ------------------------------------------------------------- sessions
   const sessions = new CallSessionManager();
   const transports = new Map<string, CallTransport>();
+
+  // Process metrics (design D10): one registry per process, fed from the
+  // session manager's existing lifecycle events (statuses + active gauge)
+  // and from each call's pipeline (stage latencies + error categories).
+  // Exposed on AppHandle for the /api/metrics endpoint (task 7.2).
+  const metrics = new MetricsRegistry();
+  attachSessionMetrics(sessions, metrics);
 
   // Lazily-built shared LLM client for post-call work (notes). The client is
   // stateless, so one instance per distinct (apiKey, baseUrl) pair is safe
@@ -222,6 +287,17 @@ export async function buildApp(
     });
   } else {
     app.log.warn("notes pipeline disabled: needs DATABASE_URL");
+  }
+
+  // GDPR retention (design D9): purge aged transcripts/notes and anonymize
+  // caller numbers once at startup, then every 24 h. The job reads the
+  // effective config per run (resolver.get), so admin changes to
+  // retention.enabled/days/hashSalt apply on the next run. Fail-safe: an
+  // empty hashSalt skips the run entirely (see src/retention/job.ts).
+  let retention: RetentionJob | undefined;
+  if (db) {
+    retention = new RetentionJob({ db, getConfig: () => resolver.get(), logger: appLog });
+    retention.schedule();
   }
 
   // ------------------------------------------------------- call lifecycle
@@ -349,13 +425,80 @@ export async function buildApp(
     if (callLlm) {
       const client = callLlm;
       languages = new LanguageManager(callConfig, client);
+      // Skills stack (design D4/D6) + built-in escalation (design D7): the
+      // loop attaches tools when manifests loaded (dispatcher present) OR
+      // escalation is wired — escalate_to_human works even with an empty
+      // skills directory. The escalation handler speaks through the
+      // pipeline's fixed-text speech path (`pipeline` is assigned below;
+      // like handleUtterance, escalation only fires once calls flow).
+      const callIdDone = callIdReady;
+      const escalate = createEscalationHandler({
+        ...(db ? { db } : {}),
+        getCallId: () => callIdDone,
+        session,
+        transport,
+        speak: (text: string) => pipeline.speakGreeting(text),
+        // Twilio REST transfer (design D7, task 5.2): attempted before the
+        // announce-and-end fallback; the handler gates it on the transport
+        // being Twilio and a staff number being configured (live-apply: the
+        // call's effective config).
+        transfer: createTwilioTransfer({ config: callConfig, logger: log }),
+        staffNumber: callConfig.escalation.staffNumber,
+        logger: log,
+      });
+      const skills: SkillLoopDeps = {
+        registry: skillRegistry,
+        ...(skillDispatcher !== undefined ? { dispatcher: skillDispatcher } : {}),
+        callId: () => {
+          const id = session.meta["callId"];
+          return typeof id === "number" ? id : undefined;
+        },
+        audit: db && callIdDone ? callEventAuditor(db, () => callIdDone, log) : undefined,
+        escalate,
+      };
       conversation = new ConversationManager({
         config: callConfig,
         llm: client,
         language: languages,
         logger: log,
+        skills,
       });
     }
+
+    // ---- Consent gate (design D5): when enabled for this call, the
+    // pipeline starts without the main STT stream and with the transcript
+    // tap locked; an ephemeral STT window classifies the caller's reply to
+    // the spoken notice (feeding the normal language vote too) until the
+    // start flow below drives consentGrant()/consentDecline(). Classification
+    // needs the utility model's tiebreaker, so without an LLM client the
+    // call runs today's ungated flow (fail-open to the pre-M4 behavior,
+    // logged) rather than a gate that could never understand a reply.
+    let consentGate: ConsentGateOptions | undefined;
+    if (callConfig.consent.enabled) {
+      if (callLlm && languages) {
+        const languagesRef = languages;
+        consentGate = {
+          classifier: new AffirmationClassifier({ config: callConfig, llm: callLlm, logger: log }),
+          initialLanguage: callConfig.consent.initialLanguage,
+          // Same language path the first normal utterance takes: detect +
+          // lock on the first reply, re-lock on later ones (D5 double duty).
+          languageVote: (text, hint) =>
+            languagesRef.current === null
+              ? languagesRef.detect(text, hint)
+              : languagesRef.maybeRelock(text, hint),
+        };
+      } else {
+        log.warn("consent gate disabled: reply classification needs an LLM client");
+      }
+    }
+
+    /**
+     * Barge-in hook into the consent start-flow below. The agent adapter (the
+     * only barge-in observer at this layer) forwards caller interrupts here;
+     * the flow uses them to replay an interrupted notice. Undefined on
+     * ungated calls and set once the gated start flow arms itself.
+     */
+    let consentBargeIn: (() => void) | undefined;
 
     const onUtterance = transcriptWriter
       ? (u: PipelineUtterance): void => void transcriptWriter.write(u)
@@ -383,7 +526,10 @@ export async function buildApp(
           }
           yield* conversationRef.handleUtterance(text, detected);
         },
-        onBargeIn: () => conversationRef.onBargeIn(),
+        onBargeIn: () => {
+          conversationRef.onBargeIn();
+          consentBargeIn?.(); // the consent start-flow replays an interrupted notice (D5)
+        },
         setLanguage: (language) => conversationRef.setLanguage(language),
         close: () => conversationRef.close(),
       };
@@ -396,6 +542,8 @@ export async function buildApp(
         resolveVoice: voice,
         logger: log,
         onUtterance,
+        metrics,
+        consentGate,
       });
     } else {
       // Degraded: no LLM. The pipeline still transcribes; no replies, no greeting.
@@ -408,6 +556,8 @@ export async function buildApp(
         resolveVoice: voice,
         logger: log,
         onUtterance,
+        metrics,
+        consentGate,
       });
       log.warn("llm_not_configured: no OPENROUTER_API_KEY — call runs without replies");
       transport.announce({ type: "status", text: "llm_not_configured" });
@@ -416,16 +566,140 @@ export async function buildApp(
     pipeline.start();
 
     // Greeting is composition policy, not pipeline behavior.
-    if (conversation) {
+    const startGreeting = (): void => {
+      if (conversation === undefined || !session.isActive) return;
       const greeting = conversation.greet();
       void pipeline.speakGreeting(greeting).catch((err: unknown) => {
         log.warn({ err }, "greeting playback failed");
       });
+    };
+
+    // ---- Call-start consent flow (design D5, task 4.2). The pipeline only
+    // REPORTS consent-window replies; this flow decides and drives it:
+    //
+    //   notice (spoken in consent.initialLanguage) → caller's reply
+    //     affirmative → record "granted" → consentGrant() → greeting (the
+    //                   gate's language vote already pinned the language)
+    //     decline     → record "declined" → goodbye → hangup(consent_declined)
+    //     unclear     → re-ask ONCE → second consecutive unclear → declined
+    //   barge-in over the notice/re-ask (the pipeline tears the ephemeral
+    //     window down) → replay the notice ONCE → a second interruption
+    //     resolves fail-closed as declined.
+    //
+    // Every unresolved path is fail-closed: ambiguity or a broken notice
+    // never unlocks the transcript. Recording (calls.consent + call_events)
+    // is fire-and-forget: failures are logged, the spoken flow continues.
+    const startConsentFlow = (): void => {
+      if (conversation === undefined || !session.isActive) return;
+      // The call opens in the notice language (TTS voice, agent prompt,
+      // greeting) until the caller's reply vote proves otherwise. While
+      // gated, setLanguage is a pure state update — no STT stream exists
+      // before the grant.
+      pipeline.setLanguage(callConfig.consent.initialLanguage);
+
+      let settled = false; // a decision landed — every later signal is ignored
+      let unclearReplies = 0; // consecutive unclear answers
+      let noticeReplays = 0; // barge-in restarts of the notice
+
+      /** Fire-and-forget persistence of the decision; never throws. */
+      const recordConsent = (decision: Consent, detail: Record<string, unknown>): void => {
+        if (db === undefined || callIdReady === undefined) return;
+        const database = db;
+        void callIdReady
+          .then(async (callId) => {
+            if (callId === undefined) return; // the call row never landed
+            await setCallConsent(database, callId, decision);
+            await insertCallEvent(database, {
+              callId,
+              type: decision === "granted" ? "consent_granted" : "consent_declined",
+              detail,
+            });
+          })
+          .catch((err: unknown) => {
+            log.error({ err, decision }, "failed to record consent decision; continuing the call");
+          });
+      };
+
+      const settleGranted = (utterance: ConsentUtterance): void => {
+        settled = true;
+        recordConsent("granted", { language: utterance.language ?? null });
+        pipeline.consentGrant(); // opens the main STT stream + attaches the tap
+        startGreeting(); // spoken in the voted/session language
+      };
+
+      const settleDeclined = (reason: "explicit" | "unclear_x2" | "unresolved"): void => {
+        settled = true;
+        recordConsent("declined", { reason });
+        session.meta[SESSION_CONSENT_DECLINED_KEY] = true;
+        pipeline.consentDecline(); // nothing is ever transcribed on this call
+        // Goodbye in the session language (the notice language or the
+        // reply's vote), then end the call. The tap stays locked, so the
+        // goodbye is never persisted either.
+        void pipeline
+          .speakGreeting(getConsentGoodbye(session.language))
+          .catch((err: unknown) => log.warn({ err }, "consent goodbye playback failed"))
+          .then(() => transport.hangup(CONSENT_DECLINED_HANGUP_REASON))
+          .catch((err: unknown) => log.error({ err }, "consent hangup failed"));
+      };
+
+      const onReply = (reply: ConsentReply): void => {
+        if (settled || reply.verdict !== "unclear") return; // definitive verdicts arrive via onDecision
+        unclearReplies += 1;
+        if (unclearReplies >= 2) {
+          settleDeclined("unclear_x2");
+          return;
+        }
+        // Re-ask ONCE, in the language the reply's vote may have picked; the
+        // ephemeral window stays open across the re-ask.
+        void pipeline.speakGreeting(getConsentReask(session.language)).catch((err: unknown) => {
+          log.warn({ err }, "consent re-ask playback failed");
+        });
+      };
+
+      const onDecision = (decision: ConsentDecision, utterance: ConsentUtterance): void => {
+        if (settled) return;
+        if (decision === "granted") settleGranted(utterance);
+        else settleDeclined("explicit");
+      };
+
+      const speakNotice = (): void => {
+        pipeline.beginConsentPhase({ onReply, onDecision });
+        void pipeline
+          .speakGreeting(getConsentNotice(session.language))
+          .catch((err: unknown) => {
+            log.error({ err }, "consent notice playback failed");
+            if (!settled) settleDeclined("unresolved"); // fail-closed
+          });
+      };
+
+      // Caller talked over the notice/re-ask: the pipeline already tore the
+      // ephemeral window down. Policy (kept simple): the notice is replayed
+      // once; a second interruption resolves fail-closed as declined, so an
+      // unresolved consent can never stall the call or open the transcript.
+      consentBargeIn = (): void => {
+        if (settled) return;
+        if (noticeReplays >= 1) {
+          settleDeclined("unresolved");
+          return;
+        }
+        noticeReplays += 1;
+        pipeline.cancelConsentPhase(); // no-op after the pipeline's own teardown
+        speakNotice();
+      };
+
+      speakNotice();
+    };
+
+    if (consentGate !== undefined) {
+      startConsentFlow();
+    } else {
+      startGreeting();
     }
 
     const cleanup = (): void => {
       transport.removeListener("hangup", onHangup);
       transport.removeListener("error", onError);
+      consentBargeIn = undefined;
       pipeline.close();
       transports.delete(info.callSid);
     };
@@ -494,7 +768,7 @@ export async function buildApp(
   });
 
   if (db) {
-    registerAdminApi(app, { db: kyselyAdminDb(db), config });
+    registerAdminApi(app, { db: kyselyAdminDb(db), config, metrics });
     registerAdminPages(app, { db: kyselyAdminDb(db), config });
     // Settings console (HTML form at /admin/settings): same basic-auth scope,
     // same persistence seam as /api/settings. A successful save invalidates
@@ -528,9 +802,14 @@ export async function buildApp(
     db,
     providers: { stt, tts, llm },
     sessions,
+    metrics,
     transports,
+    retention,
     startCallSession,
     close: async () => {
+      // Stop the retention scheduler before anything else tears down; an
+      // in-flight purge run finishes on its own.
+      retention?.stop();
       await app.close();
       if (dbOwned && db) await closeDb(db);
     },

@@ -21,6 +21,9 @@ export type NullableTimestamp = ColumnType<
   Date | string | undefined
 >;
 
+/** Outcome of the spoken consent check, stored in calls.consent. */
+export type Consent = "granted" | "declined";
+
 /**
  * calls — one row per telephony call, keyed by the provider's call SID.
  * Column names are snake_case to match the SQL schema directly.
@@ -36,6 +39,10 @@ export interface CallsTable {
   started_at: Timestamp;
   ended_at: NullableTimestamp;
   duration_s: ColumnType<number | undefined, number | undefined, number | undefined>;
+  /** null until the consent flow records a decision. */
+  consent: ColumnType<Consent | undefined, Consent | undefined, Consent | undefined>;
+  /** DB default false; flipped when the call is handed to a human. */
+  escalated: Generated<boolean>;
 }
 
 /** call_transcripts — per-utterance transcript rows in call order. */

@@ -3,14 +3,15 @@ import type { Kysely } from "kysely";
 import { configSchema, type AppConfig } from "../../src/config/schema.js";
 import type { Database } from "../../src/db/schema.js";
 import type { ChatOptions } from "../../src/llm/openrouter.js";
-import { parseNote, summarizeCall } from "../../src/notes/summarizer.js";
-import type { TranscriptRow } from "../../src/db/queries.js";
-import { getTranscript, insertCallEvent, upsertNote } from "../../src/db/queries.js";
+import { ESCALATION_ACTION, parseNote, summarizeCall } from "../../src/notes/summarizer.js";
+import { getCallById, getTranscript, insertCallEvent, upsertNote } from "../../src/db/queries.js";
+import type { CallRow, TranscriptRow } from "../../src/db/queries.js";
 
 vi.mock("../../src/db/queries.js", async () => {
   const actual = await vi.importActual<Record<string, unknown>>("../../src/db/queries.js");
   return {
     ...actual,
+    getCallById: vi.fn(async () => null as CallRow | null),
     getTranscript: vi.fn(async () => [] as TranscriptRow[]),
     upsertNote: vi.fn(async () => undefined),
     insertCallEvent: vi.fn(async () => 1),
@@ -19,6 +20,7 @@ vi.mock("../../src/db/queries.js", async () => {
 
 import type { Logger } from "../../src/logging.js";
 
+const getCallByIdMock = vi.mocked(getCallById);
 const getTranscriptMock = vi.mocked(getTranscript);
 const upsertNoteMock = vi.mocked(upsertNote);
 const insertCallEventMock = vi.mocked(insertCallEvent);
@@ -75,6 +77,7 @@ const opts = () => ({ db: fakeDb, llm: { chat }, config, callId: 11, logger });
 
 beforeEach(() => {
   chat.mockClear().mockResolvedValue(validNoteJson);
+  getCallByIdMock.mockClear().mockResolvedValue(null);
   getTranscriptMock.mockClear().mockResolvedValue(transcript);
   upsertNoteMock.mockClear().mockResolvedValue(undefined);
   insertCallEventMock.mockClear().mockResolvedValue(1);
@@ -193,5 +196,64 @@ describe("summarizeCall", () => {
     await summarizeCall({ db: fakeDb, llm: { chat }, config: withOverride, callId: 11, logger });
     // The summarizer role is resolved without a language, so the role default wins.
     expect(chat.mock.calls[0]![0].model).toBe("default-sum");
+  });
+});
+
+describe("escalated-call note enforcement (task 5.1)", () => {
+  const callRow = (escalated: boolean): CallRow => ({
+    id: 11,
+    callSid: "CA-test",
+    from: "+37251234567",
+    to: null,
+    provider: "twilio",
+    language: "et",
+    status: "completed",
+    startedAt: new Date("2026-10-13T14:05:09.000Z"),
+    endedAt: new Date("2026-10-13T14:07:39.000Z"),
+    durationS: 150,
+    consent: "granted",
+    escalated,
+  });
+
+  it("forces urgency high + the escalation action when calls.escalated, even when the model says low", async () => {
+    getCallByIdMock.mockResolvedValue(callRow(true));
+    const note = await summarizeCall(opts());
+
+    expect(note.urgency).toBe("high");
+    expect(note.actions_taken).toContain(ESCALATION_ACTION);
+    // The rest of the model output is kept as-is.
+    expect(note.summary).toBe("Caller asked about their invoice.");
+    expect(upsertNoteMock).toHaveBeenCalledWith(fakeDb, {
+      callId: 11,
+      note,
+      model: "test-summarizer-model",
+    });
+  });
+
+  it("forces via the session flag even when the calls-row read fails", async () => {
+    getCallByIdMock.mockRejectedValue(new Error("db down"));
+    const note = await summarizeCall({ ...opts(), escalated: true });
+
+    expect(note.urgency).toBe("high");
+    expect(note.actions_taken).toContain(ESCALATION_ACTION);
+    // The note is still stored; the flag-read failure never fails the note.
+    expect(upsertNoteMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not force anything when the call was not escalated", async () => {
+    getCallByIdMock.mockResolvedValue(callRow(false));
+    const note = await summarizeCall({ ...opts(), escalated: false });
+
+    expect(note.urgency).toBe("low"); // model output stands
+    expect(note.actions_taken).not.toContain(ESCALATION_ACTION);
+  });
+
+  it("appends the escalation action exactly once", async () => {
+    getCallByIdMock.mockResolvedValue(callRow(true));
+    chat.mockResolvedValue(validNoteJson.replace('"actions_taken": []', `"actions_taken": ["${ESCALATION_ACTION}"]`));
+
+    const note = await summarizeCall(opts());
+
+    expect(note.actions_taken.filter((a) => a === ESCALATION_ACTION)).toHaveLength(1);
   });
 });

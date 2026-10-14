@@ -8,7 +8,7 @@
 
 import type { Kysely } from "kysely";
 import type { AppConfig } from "../config/schema.js";
-import { getTranscript, insertCallEvent, upsertNote } from "../db/queries.js";
+import { getCallById, getTranscript, insertCallEvent, upsertNote } from "../db/queries.js";
 import type { Database } from "../db/schema.js";
 import { resolveModel } from "../llm/resolve-model.js";
 import type { ChatMessage, ChatOptions } from "../llm/openrouter.js";
@@ -26,6 +26,14 @@ export interface SummarizeCallOptions {
   llm: SummarizerLlm;
   config: AppConfig;
   callId: number;
+  /**
+   * Escalation flag from the session (meta.escalated, set by the escalation
+   * handler). The persisted calls.escalated row is checked regardless; the
+   * session flag covers a failed/lost db write. Either true → the stored
+   * note's urgency is forced to "high" with escalation among actions_taken
+   * (design D7), whatever the model output says.
+   */
+  escalated?: boolean;
   logger?: Logger;
 }
 
@@ -54,6 +62,9 @@ Rules:
 
 const MAX_SUMMARY_TOKENS = 800;
 const SUMMARY_TEMPERATURE = 0.2;
+
+/** Stored among actions_taken for escalated calls (design D7). */
+export const ESCALATION_ACTION = "escalated the call to a human agent";
 
 /**
  * Summarize a finished call into a structured note and persist it.
@@ -103,10 +114,41 @@ export async function summarizeCall(options: SummarizeCallOptions): Promise<Note
     }
   }
 
+  // Escalation enforcement (design D7): post-model, regardless of what the
+  // summarizer judged — an escalated call is always urgent with the handover
+  // among the actions taken. Failures reading the calls row never fail the
+  // note (the session flag above already covers the handler's write).
+  const escalated =
+    options.escalated === true || (await readEscalatedFromRow(db, callId, log));
+  if (escalated) {
+    note.urgency = "high";
+    if (!note.actions_taken.includes(ESCALATION_ACTION)) {
+      note.actions_taken = [...note.actions_taken, ESCALATION_ACTION];
+    }
+  }
+
   await upsertNote(db, { callId, note, model });
   await insertCallEvent(db, { callId, type: "note_generated", detail: { model } });
   log.info({ callId, model }, "note generated");
   return note;
+}
+
+/**
+ * Read calls.escalated for one call; a failed read is warned about and
+ * treated as false so note generation never breaks on the flag.
+ */
+async function readEscalatedFromRow(
+  db: Kysely<Database>,
+  callId: number,
+  log: Logger,
+): Promise<boolean> {
+  try {
+    const call = await getCallById(db, callId);
+    return call?.escalated === true;
+  } catch (err) {
+    log.warn({ err, callId }, "notes: failed to read calls.escalated; urgency not forced");
+    return false;
+  }
 }
 
 /** Render persisted transcript rows as "caller: ..." / "agent: ..." lines. */

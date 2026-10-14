@@ -101,6 +101,50 @@ function mapEnv(env: NodeJS.ProcessEnv): Record<string, unknown> {
 
   out.admin = pick(env, { user: "ADMIN_USER", password: "ADMIN_PASSWORD" });
 
+  // skills.http/skills.auth are records with no generic env convention; the
+  // shipped booking endpoint and calendar auth ref get flat, name-specific
+  // keys (see .env.example). Additional endpoints/refs go through the JSON
+  // config file. Entries are only emitted when the env sets at least one key
+  // of theirs — an empty `{ booking: {} }` would fail the schema (url is
+  // required) — and deepMerge still layers them over file-config entries.
+  const skillsHttpBooking = pick(env, {
+    url: "SKILLS_HTTP_BOOKING_URL",
+    method: "SKILLS_HTTP_BOOKING_METHOD",
+    timeoutMs: env.SKILLS_HTTP_BOOKING_TIMEOUT_MS
+      ? Number(env.SKILLS_HTTP_BOOKING_TIMEOUT_MS)
+      : undefined,
+  });
+  const skillsAuthCalendar = pick(env, {
+    header: "SKILLS_AUTH_CALENDAR_HEADER",
+    value: "SKILLS_AUTH_CALENDAR_VALUE",
+  });
+  const skills: Record<string, unknown> = pick(env, {
+    dir: "SKILLS_DIR",
+    maxToolIterations: env.SKILLS_MAX_TOOL_ITERATIONS
+      ? Number(env.SKILLS_MAX_TOOL_ITERATIONS)
+      : undefined,
+  });
+  if (Object.keys(skillsHttpBooking).length > 0) {
+    skills.http = { booking: skillsHttpBooking };
+  }
+  if (Object.keys(skillsAuthCalendar).length > 0) {
+    skills.auth = { calendar: skillsAuthCalendar };
+  }
+  out.skills = skills;
+
+  out.consent = pick(env, {
+    enabled: env.CONSENT_ENABLED !== undefined ? env.CONSENT_ENABLED === "true" : undefined,
+    initialLanguage: "CONSENT_INITIAL_LANGUAGE",
+  });
+
+  out.escalation = pick(env, { staffNumber: "ESCALATION_STAFF_NUMBER" });
+
+  out.retention = pick(env, {
+    enabled: env.RETENTION_ENABLED !== undefined ? env.RETENTION_ENABLED === "true" : undefined,
+    days: env.RETENTION_DAYS ? Number(env.RETENTION_DAYS) : undefined,
+    hashSalt: "RETENTION_HASH_SALT",
+  });
+
   return out;
 }
 

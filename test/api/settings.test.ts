@@ -2,6 +2,7 @@ import Fastify from "fastify";
 import pino from "pino";
 import type { FastifyInstance } from "fastify";
 import type { Kysely } from "kysely";
+import { sql } from "kysely";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   kyselySettingsDb,
@@ -204,15 +205,110 @@ describe("settings api (fake db)", () => {
     expect(db.doc()).toEqual({ vad: { threshold: 0.05 } });
     expect(put.body.overrides).toEqual(["vad.threshold"]);
   });
+
+  it("lists the new M4 paths in sections and masks the unset hashSalt", async () => {
+    await app.ready();
+    const body = await getJson(app);
+    const paths = body.sections.flatMap((section) => section.fields.map((field) => field.path));
+    expect(paths).toEqual(
+      expect.arrayContaining([
+        "consent.enabled",
+        "consent.initialLanguage",
+        "retention.enabled",
+        "retention.days",
+        "retention.hashSalt",
+        "escalation.staffNumber",
+      ]),
+    );
+    // skills.* stays file/env-only and must not surface as editable
+    expect(paths).not.toContain("skills.dir");
+    expect(getAtPath(body.values, "retention.hashSalt")).toEqual({ set: false, hint: null });
+  });
+
+  it("PUT persists retention.days (and consent/escalation edits) with overrides", async () => {
+    await app.ready();
+    const put = await putJson(app, {
+      values: {
+        retention: { days: 30 },
+        consent: { enabled: false },
+        escalation: { staffNumber: "372555111" },
+      },
+    });
+    expect(put.status).toBe(200);
+    expect(getAtPath(put.body.values, "retention.days")).toBe(30);
+    expect(getAtPath(put.body.values, "consent.enabled")).toBe(false);
+    expect(getAtPath(put.body.values, "escalation.staffNumber")).toBe("372555111");
+    for (const path of ["retention.days", "consent.enabled", "escalation.staffNumber"]) {
+      expect(put.body.overrides).toContain(path);
+    }
+    const body = await getJson(app);
+    expect(getAtPath(body.values, "retention.days")).toBe(30);
+    expect(db.doc()).toEqual({
+      retention: { days: 30 },
+      consent: { enabled: false },
+      escalation: { staffNumber: "372555111" },
+    });
+  });
+
+  it("PUT stores retention.hashSalt but GET masks it as {set, hint}, never raw", async () => {
+    await app.ready();
+    const put = await putJson(app, { values: { retention: { hashSalt: "salt-secret-4321" } } });
+    expect(put.status).toBe(200);
+    expect(put.body.overrides).toContain("retention.hashSalt");
+    expect(getAtPath(put.body.values, "retention.hashSalt")).toEqual({ set: true, hint: "…4321" });
+    expect(JSON.stringify(put.body)).not.toContain("salt-secret-4321");
+    expect(db.doc()).toEqual({ retention: { hashSalt: "salt-secret-4321" } });
+
+    const body = await getJson(app);
+    expect(getAtPath(body.values, "retention.hashSalt")).toEqual({ set: true, hint: "…4321" });
+    expect(JSON.stringify(body)).not.toContain("salt-secret-4321");
+  });
+
+  it("PUT drops skills.* paths silently (file/env-only, not editable)", async () => {
+    await app.ready();
+    const put = await putJson(app, {
+      values: {
+        skills: { dir: "/etc", http: { booking: { url: "https://x.example" } } },
+        retention: { days: 14 },
+      },
+    });
+    expect(put.status).toBe(200);
+    expect(db.doc()).toEqual({ retention: { days: 14 } });
+    expect(put.body.overrides).toEqual(["retention.days"]);
+  });
+
+  it("PUT rejects out-of-range M4 values with the zod issue list", async () => {
+    await app.ready();
+    const days = await putJson(app, { values: { retention: { days: 0 } } });
+    expect(days.status).toBe(400);
+    expect(days.body.issues?.some((issue) => issue.path === "retention.days")).toBe(true);
+    expect(db.saveSettingsDoc).not.toHaveBeenCalled();
+
+    const language = await putJson(app, { values: { consent: { initialLanguage: "fr" } } });
+    expect(language.status).toBe(400);
+    expect(language.body.issues?.some((issue) => issue.path === "consent.initialLanguage")).toBe(
+      true,
+    );
+  });
 });
 
 describe.skipIf(!databaseUrl)("settings api (postgres)", () => {
+  // Scratch database on the same server: this suite reads/writes the shared
+  // `settings` row, which other DB-backed suites (consent flow) delete in
+  // parallel — an isolated database removes the cross-file race both ways.
+  let admin: Kysely<Database>;
   let db: Kysely<Database>;
   let app: FastifyInstance;
+  const SCRATCH_DB = "voice_settings_api_test";
   const config = makeConfig();
 
   beforeAll(async () => {
-    db = createDb(databaseUrl as string);
+    admin = createDb(databaseUrl as string);
+    await sql`DROP DATABASE IF EXISTS ${sql.raw(SCRATCH_DB)} WITH (FORCE)`.execute(admin);
+    await sql`CREATE DATABASE ${sql.raw(SCRATCH_DB)}`.execute(admin);
+    const scratchUrl = new URL(databaseUrl as string);
+    scratchUrl.pathname = `/${SCRATCH_DB}`;
+    db = createDb(scratchUrl.toString());
     await runMigrations(db);
     await db.deleteFrom("settings").where("key", "=", "global").execute();
     app = buildApp(kyselySettingsDb(db), config);
@@ -222,7 +318,11 @@ describe.skipIf(!databaseUrl)("settings api (postgres)", () => {
   afterAll(async () => {
     await db.deleteFrom("settings").where("key", "=", "global").execute();
     await app?.close();
-    await closeDb(db);
+    if (db) await closeDb(db);
+    if (admin) {
+      await sql`DROP DATABASE IF EXISTS ${sql.raw(SCRATCH_DB)} WITH (FORCE)`.execute(admin);
+      await closeDb(admin);
+    }
   });
 
   it("persists a PUT, reflects it on GET and in the effective config", async () => {

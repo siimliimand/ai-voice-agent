@@ -78,13 +78,14 @@ function renderList(rows: CallListItem[]): string {
   <td>${link(escapeHtml(row.language ?? "—"))}</td>
   <td>${link(escapeHtml(formatDuration(row.durationS)))}</td>
   <td>${link(statusBadge(row.status))}</td>
+  <td>${link(consentBadge(row.consent) + escalatedBadge(row.escalated))}</td>
   <td class="excerpt">${link(escapeHtml(truncate(row.noteSummary)))}</td>
 </tr>`;
     })
     .join("\n");
   return `<table>
   <thead>
-    <tr><th>Time</th><th>Caller</th><th>Language</th><th>Duration</th><th>Status</th><th>Note</th></tr>
+    <tr><th>Time</th><th>Caller</th><th>Language</th><th>Duration</th><th>Status</th><th>Flags</th><th>Note</th></tr>
   </thead>
   <tbody>
 ${body}
@@ -108,6 +109,8 @@ async function renderDetail(db: AdminDb, callId: number): Promise<string | null>
   <dt>Destination</dt><dd>${escapeHtml(call.to ?? "—")}</dd>
   <dt>Provider</dt><dd>${escapeHtml(call.provider)}</dd>
   <dt>Status</dt><dd>${statusBadge(call.status)}</dd>
+  <dt>Consent</dt><dd>${consentBadge(call.consent)}</dd>
+  <dt>Escalated</dt><dd>${escalatedBadge(call.escalated) || '<span class="muted">—</span>'}</dd>
   <dt>Language</dt><dd>${escapeHtml(call.language ?? "—")}</dd>
   <dt>Started</dt><dd><span title="${escapeHtml(started.iso)}">${escapeHtml(started.text)}</span></dd>
   <dt>Ended</dt><dd>${ended ? `<span title="${escapeHtml(ended.iso)}">${escapeHtml(ended.text)}</span>` : "—"}</dd>
@@ -264,6 +267,22 @@ function statusBadge(status: string): string {
   return `<span class="badge badge-${escapeHtml(status)}">${escapeHtml(label)}</span>`;
 }
 
+/**
+ * Consent badge (design D8): granted/declined in the list + detail views;
+ * an em-dash placeholder before a decision was recorded.
+ */
+function consentBadge(consent: string | null): string {
+  if (consent !== "granted" && consent !== "declined") {
+    return `<span class="badge badge-flag_none">—</span>`;
+  }
+  return `<span class="badge badge-${consent}">consent ${escapeHtml(consent)}</span>`;
+}
+
+/** Escalated flag badge (design D7); empty when the call was not escalated. */
+function escalatedBadge(escalated: boolean): string {
+  return escalated ? `<span class="badge badge-escalated">escalated</span>` : "";
+}
+
 /** Truncate a note summary to NOTE_EXCERPT_MAX characters ("…" included). */
 export function truncate(value: string | null, max: number = NOTE_EXCERPT_MAX): string {
   if (!value) return "";
@@ -324,6 +343,10 @@ function renderPage(title: string, body: string): string {
   .badge-completed { background: #e3f5e9; color: #1c7c3d; }
   .badge-in_progress { background: #fdf2d7; color: #8a6116; }
   .badge-failed { background: #fde5e5; color: #b02a2a; }
+  .badge-granted { background: #e3f5e9; color: #1c7c3d; }
+  .badge-declined { background: #fde5e5; color: #b02a2a; }
+  .badge-escalated { background: #fdecd2; color: #9a5b00; }
+  .badge-flag_none { background: #eef2f6; color: #94a3b8; }
   .empty { background: #fff; border: 1px dashed #cbd5de; border-radius: 8px;
            padding: 28px; text-align: center; color: #52616f; margin: 16px 0; }
   .empty h1 { color: #b02a2a; }

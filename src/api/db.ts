@@ -1,5 +1,6 @@
 import type { Kysely } from "kysely";
 import {
+  countCallsByStatus,
   getCallById,
   getCallBySid,
   getNote,
@@ -11,6 +12,7 @@ import {
   type TranscriptRow,
 } from "../db/queries.js";
 import type { Database } from "../db/schema.js";
+import type { CallStatus } from "../types.js";
 
 /**
  * Read-side data source of the admin console. The shape mirrors the query
@@ -24,6 +26,8 @@ export interface AdminDb {
   getCallBySid(sid: string): Promise<CallRow | null>;
   getTranscript(callId: number): Promise<TranscriptRow[]>;
   getNote(callId: number): Promise<NoteRow | null>;
+  /** Per-status call counts for GET /api/metrics (DB layer, design D10). */
+  countCallsByStatus(): Promise<Record<CallStatus, number>>;
 }
 
 /** Bind the read-only admin queries to a Kysely instance. */
@@ -34,5 +38,6 @@ export function kyselyAdminDb(db: Kysely<Database>): AdminDb {
     getCallBySid: (sid) => getCallBySid(db, sid),
     getTranscript: (callId) => getTranscript(db, callId),
     getNote: (callId) => getNote(db, callId),
+    countCallsByStatus: () => countCallsByStatus(db),
   };
 }
